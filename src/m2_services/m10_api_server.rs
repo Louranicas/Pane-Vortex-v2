@@ -127,6 +127,24 @@ pub struct AckRequest {
     pub message_id: u64,
 }
 
+/// Request body for `POST /sphere/{pane_id}/phase`.
+#[derive(Debug, Deserialize)]
+pub struct PhaseRequest {
+    /// New phase value (radians, will be wrapped to [0, 2π)).
+    pub phase: Option<f64>,
+    /// New frequency value (Hz, clamped to valid range).
+    pub frequency: Option<f64>,
+}
+
+/// Request body for `POST /sphere/{pane_id}/steer`.
+#[derive(Debug, Deserialize)]
+pub struct SteerRequest {
+    /// Target phase (radians).
+    pub target_phase: f64,
+    /// Steering strength (clamped to [0.0, 2.0]).
+    pub strength: f64,
+}
+
 // ──────────────────────────────────────────────────────────────
 // Error response
 // ──────────────────────────────────────────────────────────────
@@ -189,20 +207,28 @@ fn parse_status(s: &str) -> Result<PaneStatus, PvError> {
 // Core route handlers (3)
 // ──────────────────────────────────────────────────────────────
 
-/// GET /health -- Basic health check.
+/// GET /health -- Basic health check (V1-compatible fields).
 async fn health_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
-    let (r, sphere_count, tick, fleet_mode) = {
+    let (r, sphere_count, tick, fleet_mode, warmup) = {
         let guard = ctx.state.read();
         let r = guard.r_history.back().copied().unwrap_or(0.0);
-        (r, guard.spheres.len(), guard.tick, guard.fleet_mode())
+        (r, guard.spheres.len(), guard.tick, guard.fleet_mode(), guard.warmup_remaining)
+    };
+
+    let (k, k_mod) = {
+        let net = ctx.network.read();
+        (net.k, net.k_modulation)
     };
 
     Json(serde_json::json!({
-        "status": "ok",
+        "status": "healthy",
         "r": r,
         "spheres": sphere_count,
         "tick": tick,
         "fleet_mode": format!("{fleet_mode:?}"),
+        "k": k,
+        "k_modulation": k_mod,
+        "warmup_remaining": warmup,
     }))
 }
 
@@ -596,6 +622,103 @@ async fn heartbeat_handler(
 }
 
 // ──────────────────────────────────────────────────────────────
+// Gap fix handlers (3) — V1 compatibility
+// ──────────────────────────────────────────────────────────────
+
+/// POST `/sphere/{pane_id}/phase` -- Update phase and/or frequency (Gap 1).
+async fn phase_handler(
+    State(ctx): State<AppContext>,
+    Path(pane_id): Path<String>,
+    Json(body): Json<PhaseRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_pane_id(&pane_id)?;
+    let pid = PaneId::new(&pane_id);
+
+    // Validate inputs before acquiring lock
+    let validated_phase = body.phase.map(|p| {
+        if p.is_finite() { Ok(p.rem_euclid(std::f64::consts::TAU)) }
+        else { Err(PvError::NonFinite { field: "phase", value: p }) }
+    }).transpose()?;
+    let validated_freq = body.frequency.map(validate_frequency).transpose()?;
+
+    let (new_phase, new_freq) = {
+        let mut guard = ctx.state.write();
+        if !guard.spheres.contains_key(&pid) {
+            return Err(PvError::SphereNotFound(pane_id).into());
+        }
+        if let Some(phase) = validated_phase {
+            if let Some(s) = guard.spheres.get_mut(&pid) { s.phase = phase; }
+        }
+        if let Some(freq) = validated_freq {
+            if let Some(s) = guard.spheres.get_mut(&pid) {
+                s.frequency = freq;
+                s.base_frequency = freq;
+            }
+        }
+        if let Some(s) = guard.spheres.get_mut(&pid) { s.touch_heartbeat(); }
+        guard.state_changes += 1;
+        guard.mark_dirty();
+        let s = &guard.spheres[&pid];
+        (s.phase, s.frequency)
+    };
+
+    // Sync to coupling network
+    if let Some(freq) = body.frequency {
+        let mut net = ctx.network.write();
+        if let Some(net_freq) = net.frequencies.get_mut(&pid) {
+            *net_freq = validate_frequency(freq)?;
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "pane_id": pane_id,
+        "phase": new_phase,
+        "frequency": new_freq,
+    })))
+}
+
+/// POST `/sphere/{pane_id}/steer` -- Steer phase toward target (Gap 2).
+async fn steer_handler(
+    State(ctx): State<AppContext>,
+    Path(pane_id): Path<String>,
+    Json(body): Json<SteerRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_pane_id(&pane_id)?;
+    if !body.target_phase.is_finite() {
+        return Err(PvError::NonFinite { field: "target_phase", value: body.target_phase }.into());
+    }
+    let pid = PaneId::new(&pane_id);
+    let target = body.target_phase.rem_euclid(std::f64::consts::TAU);
+    let strength = body.strength.clamp(0.0, 2.0);
+
+    {
+        let mut guard = ctx.state.write();
+        let sphere = guard
+            .spheres
+            .get_mut(&pid)
+            .ok_or_else(|| PvError::SphereNotFound(pane_id.clone()))?;
+        let effective = strength * sphere.receptivity;
+        sphere.steer_toward(target, effective);
+        sphere.touch_heartbeat();
+        guard.state_changes += 1;
+    };
+
+    Ok(Json(serde_json::json!({
+        "pane_id": pane_id,
+        "target_phase": target,
+        "strength": strength,
+    })))
+}
+
+/// GET /bus/suggestions -- Field-driven suggestions (Gap 3 — stub).
+async fn bus_suggestions_handler(State(_ctx): State<AppContext>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "suggestions": [],
+        "total_generated": 0,
+    }))
+}
+
+// ──────────────────────────────────────────────────────────────
 // Sphere advanced handlers (4)
 // ──────────────────────────────────────────────────────────────
 
@@ -905,6 +1028,10 @@ pub fn build_router(ctx: AppContext) -> Router {
         .route("/sphere/{pane_id}/memory", post(memory_handler))
         .route("/sphere/{pane_id}/status", post(status_handler))
         .route("/sphere/{pane_id}/heartbeat", post(heartbeat_handler))
+        // Gap fix routes (3)
+        .route("/sphere/{pane_id}/phase", post(phase_handler))
+        .route("/sphere/{pane_id}/steer", post(steer_handler))
+        .route("/bus/suggestions", get(bus_suggestions_handler))
         // Sphere advanced (4)
         .route("/sphere/{pane_id}/neighbors", get(neighbors_handler))
         .route("/sphere/{pane_id}/inbox", get(inbox_handler))
@@ -1112,7 +1239,7 @@ mod tests {
         let ctx = test_ctx();
         let app = build_router(ctx);
         let (_, json) = get_json(app, "/health").await;
-        assert_eq!(json["status"], "ok");
+        assert_eq!(json["status"], "healthy");
     }
 
     #[tokio::test]
