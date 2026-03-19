@@ -64,6 +64,12 @@ chrono = { version = "0.4", features = ["serde"] }
 # Configuration
 figment = { version = "0.10", features = ["toml", "env"] }
 
+# Networking (SO_REUSEADDR for bind retry)
+socket2 = "0.5"
+
+# Platform (signal handling, directory paths)
+dirs = "6"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio-test = "0.4"
