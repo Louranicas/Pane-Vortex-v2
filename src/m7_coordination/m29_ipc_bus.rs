@@ -858,7 +858,12 @@ async fn read_loop(
                 } else if let Some(f) = parse_v1_frame(&line) {
                     f
                 } else {
-                    warn!(line = %line.chars().take(100).collect::<String>(), "unparseable frame, skipping");
+                    // Check for V1 Ping (keepalive) — silently skip
+                    if line.contains("\"Ping\"") || line.contains("\"ping\"") {
+                        tracing::trace!("V1 keepalive ping, skipping");
+                    } else {
+                        warn!(line = %line.chars().take(100).collect::<String>(), "unparseable frame, skipping");
+                    }
                     continue;
                 };
 
