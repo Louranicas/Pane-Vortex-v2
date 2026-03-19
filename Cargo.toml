@@ -1,0 +1,91 @@
+[package]
+name = "pane-vortex-v2"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.75"
+description = "The Habitat — Kuramoto-coupled oscillator field for multi-pane fleet coordination (V2)"
+authors = ["Luke O'Mahoney <louranicas@users.noreply.gitlab.com>"]
+license = "MIT"
+repository = "https://gitlab.com/lukeomahoney/pane-vortex"
+
+[[bin]]
+name = "pane-vortex"
+path = "src/bin/main.rs"
+
+[[bin]]
+name = "pane-vortex-client"
+path = "src/bin/client.rs"
+
+[lib]
+name = "pane_vortex"
+path = "src/lib.rs"
+
+[features]
+default = ["api", "persistence", "bridges"]
+api = ["axum", "tower-http"]
+persistence = ["rusqlite"]
+bridges = []
+evolution = []    # Feature-gated evolution chamber
+governance = []   # Feature-gated collective governance (V3.4)
+full = ["api", "persistence", "bridges", "evolution", "governance"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server (feature-gated)
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Database (feature-gated)
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+# Synchronization (ME v2 gold standard: parking_lot for interior mutability)
+parking_lot = "0.12"
+
+# Error handling (ME v2 gold standard: thiserror for structured errors)
+thiserror = "2"
+
+# Identifiers
+uuid = { version = "1", features = ["v4"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Configuration
+figment = { version = "0.10", features = ["toml", "env"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio-test = "0.4"
+tempfile = "3"
+approx = "0.5"
+
+[[bench]]
+name = "tick_loop"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1
+
+# Clippy configuration
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

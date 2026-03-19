@@ -1,0 +1,73 @@
+{
+  "project": "pane-vortex-v2",
+  "version": "2.0.0",
+  "status": "scaffolded",
+  "plan": "MASTERPLAN.md",
+  "port": 8132,
+  "service_id": "pane-vortex",
+  "devenv_batch": 5,
+  "layers": {
+    "L1_foundation": {
+      "modules": ["m01_core_types", "m02_error_handling", "m03_config", "m04_constants", "m05_traits", "m06_validation"],
+      "status": "stub",
+      "dependencies": []
+    },
+    "L2_services": {
+      "modules": ["m07_service_registry", "m08_health_monitor", "m09_lifecycle", "m10_api_server"],
+      "status": "stub",
+      "dependencies": ["L1"],
+      "feature_gates": ["api"]
+    },
+    "L3_field": {
+      "modules": ["m11_sphere", "m12_field_state", "m13_chimera", "m14_messaging", "m15_app_state"],
+      "status": "stub",
+      "dependencies": ["L1"]
+    },
+    "L4_coupling": {
+      "modules": ["m16_coupling_network", "m17_auto_k", "m18_topology"],
+      "status": "stub",
+      "dependencies": ["L1", "L3"]
+    },
+    "L5_learning": {
+      "modules": ["m19_hebbian_stdp", "m20_buoy_network", "m21_memory_manager"],
+      "status": "stub",
+      "dependencies": ["L1", "L3", "L4"]
+    },
+    "L6_bridges": {
+      "modules": ["m22_synthex_bridge", "m23_nexus_bridge", "m24_me_bridge", "m25_povm_bridge", "m26_rm_bridge", "m27_vms_bridge", "m28_consent_gate"],
+      "status": "stub",
+      "dependencies": ["L1", "L3"]
+    },
+    "L7_coordination": {
+      "modules": ["m29_ipc_bus", "m30_bus_types", "m31_conductor", "m32_executor", "m33_cascade", "m34_suggestions", "m35_tick", "m36_persistence"],
+      "status": "stub",
+      "dependencies": ["L1", "L3", "L5", "L6"],
+      "feature_gates": ["persistence"]
+    },
+    "L8_governance": {
+      "modules": ["m37_proposals", "m38_voting", "m39_consent_declaration", "m40_data_sovereignty", "m41_evolution_chamber"],
+      "status": "stub",
+      "dependencies": ["L1", "L3", "L7"],
+      "feature_gates": ["governance", "evolution"]
+    }
+  },
+  "v3_plan": {
+    "phases": ["V3.1_diagnostics", "V3.2_inhabitation", "V3.3_sovereignty", "V3.4_governance", "V3.5_consolidation"],
+    "current_phase": "scaffolding",
+    "alerts": 9,
+    "open_na_gaps": 13,
+    "open_standard_gaps": 20
+  },
+  "bridges": {
+    "synthex": {"port": 8090, "health": "/api/health", "module": "m22"},
+    "nexus": {"port": 8100, "health": "/health", "module": "m23"},
+    "me": {"port": 8080, "health": "/api/health", "module": "m24"},
+    "povm": {"port": 8125, "health": "/health", "module": "m25"},
+    "rm": {"port": 8130, "health": "/health", "module": "m26", "format": "TSV"},
+    "vms": {"port": 8120, "health": "/health", "module": "m27"}
+  },
+  "databases": {
+    "bus_tracking": "data/bus_tracking.db",
+    "field_tracking": "data/field_tracking.db"
+  }
+}

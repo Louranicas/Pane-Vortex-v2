@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "source": "PV v1 (42 anti-patterns) + Session 040 discoveries",
+  "anti_patterns": [
+    {"id": "AP01", "name": "unwrap in production", "severity": "CRITICAL", "rule": "NEVER use .unwrap() or .expect() outside #[cfg(test)]"},
+    {"id": "AP02", "name": "unsafe blocks", "severity": "CRITICAL", "rule": "Zero tolerance for unsafe. No exceptions."},
+    {"id": "AP03", "name": "pkill chain", "severity": "HIGH", "rule": "NEVER chain after pkill — exit 144 kills && chains"},
+    {"id": "AP04", "name": "cp alias", "severity": "HIGH", "rule": "Always \\cp -f — cp is aliased to interactive mode"},
+    {"id": "AP05", "name": "JSON to RM", "severity": "HIGH", "rule": "Reasoning Memory uses TSV format ONLY, never JSON"},
+    {"id": "AP06", "name": "stdout in daemon", "severity": "HIGH", "rule": "Never write to stdout in daemons — SIGPIPE kills (BUG-018)"},
+    {"id": "AP07", "name": "git status -uall", "severity": "MEDIUM", "rule": "Causes memory issues on large repos"},
+    {"id": "AP08", "name": "global k_mod", "severity": "HIGH", "rule": "Never modify k_mod without consent gate and per-sphere option"},
+    {"id": "AP09", "name": "focus-next-pane", "severity": "MEDIUM", "rule": "Use directional move-focus, never focus-next-pane"},
+    {"id": "AP10", "name": "byte slice truncation", "severity": "MEDIUM", "rule": "UTF-8 byte slicing panics on multi-byte chars"},
+    {"id": "AP11", "name": "unbounded Vec for logs", "severity": "MEDIUM", "rule": "Use VecDeque with cap, not growing Vec"},
+    {"id": "AP12", "name": "unconditional dirty flag", "severity": "MEDIUM", "rule": "Warmup dirty tautology — check condition first"},
+    {"id": "AP13", "name": "variable weight exponent", "severity": "MEDIUM", "rule": "Use fixed w² not 1+k_mod variable exponent (M12 bug)"},
+    {"id": "AP14", "name": "no heartbeat check", "severity": "HIGH", "rule": "Spheres with heartbeat=0.0 must be swept immediately"},
+    {"id": "AP15", "name": "code modification without reading", "severity": "CRITICAL", "rule": "ALWAYS read a file before modifying it"}
+  ]
+}

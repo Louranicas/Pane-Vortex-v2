@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "source": "PV v1 (79 patterns) + ME v2 gold standard",
+  "patterns": [
+    {"id": "P01", "name": "Phase wrapping", "priority": "P0", "rule": "Always .rem_euclid(TAU) after phase arithmetic"},
+    {"id": "P02", "name": "Lock ordering", "priority": "P0", "rule": "AppState BEFORE BusState, always"},
+    {"id": "P03", "name": "Error propagation", "priority": "P0", "rule": "? operator with PvError, never panic"},
+    {"id": "P04", "name": "Consent gate", "priority": "P0", "rule": "All external k_adj through consent_gated_k_adjustment()"},
+    {"id": "P05", "name": "Fire-and-forget bridge", "priority": "P0", "rule": "Raw TCP HTTP, tokio::spawn, no blocking"},
+    {"id": "P06", "name": "Feature gates", "priority": "P0", "rule": "#[cfg(feature)] for evolution, governance"},
+    {"id": "P07", "name": "Borrow extraction", "priority": "P0", "rule": "Extract values before cross-field mutations"},
+    {"id": "P08", "name": "NaN guard", "priority": "P0", "rule": "is_finite() check on all phase/frequency updates"},
+    {"id": "P09", "name": "Saturating arithmetic", "priority": "P0", "rule": "saturating_mul/add for counters to prevent overflow"},
+    {"id": "P10", "name": "Frequency clamp", "priority": "P0", "rule": "Clamp to [0.001, 10.0] on all frequency updates"},
+    {"id": "P11", "name": "Amortised prune", "priority": "P1", "rule": "Batch prune at threshold+50, not every tick"},
+    {"id": "P12", "name": "VecDeque for logs", "priority": "P1", "rule": "VecDeque with cap, not Vec for message/event logs"},
+    {"id": "P13", "name": "Chars not bytes", "priority": "P1", "rule": "chars().take(N) for string truncation, not byte slicing"},
+    {"id": "P14", "name": "SIGTERM handler", "priority": "P1", "rule": "tokio::signal::unix for graceful shutdown with timeout"},
+    {"id": "P15", "name": "WAL mode", "priority": "P1", "rule": "PRAGMA journal_mode=WAL on all SQLite connections"}
+  ]
+}

@@ -1,0 +1,87 @@
+# Pane-Vortex V2 — Default Configuration
+# Override with config/production.toml or environment variables (PV2_ prefix)
+
+[server]
+port = 8132
+bind_addr = "127.0.0.1"      # Loopback only by default (security)
+body_limit_bytes = 65536      # 65KB max request body
+
+[field]
+tick_interval_secs = 5
+coupling_steps_per_tick = 15  # Adaptive: scales with sphere count
+kuramoto_dt = 0.01            # Jacobi integration timestep
+r_target = 0.93               # Dynamic: fleet-negotiated (NA-P-3)
+r_high_threshold = 0.8
+r_low_threshold = 0.3
+r_falling_threshold = -0.03
+idle_ratio_threshold = 0.6
+phase_gap_threshold = 1.0472  # π/3 radians
+sync_threshold = 0.5
+tunnel_threshold = 0.8
+warmup_ticks = 5
+r_history_max = 60
+
+[sphere]
+max_count = 200               # Security: prevents O(N²) exhaustion
+memory_max_count = 500
+memory_prune_interval = 200   # Steps between prune checks
+decay_per_step = 0.995
+sweep_boost = 0.05
+activation_threshold = 0.3
+semantic_nudge_strength = 0.02
+last_tool_max_chars = 128     # Truncate tool names for safety
+newcomer_steps = 50           # 2x LTP boost for first N steps
+
+[coupling]
+default_weight = 0.18         # 0.3 * 0.6
+weight_exponent = 2.0         # Fixed w² (was variable 1+k_mod)
+auto_scale_k_period = 20      # Ticks between auto-K recalculation
+auto_scale_k_multiplier = 0.5
+frequency_min = 0.001
+frequency_max = 10.0
+strength_min = 0.0
+strength_max = 2.0
+
+[learning]
+hebbian_ltp = 0.01            # Long-term potentiation rate
+hebbian_ltd = 0.002           # Long-term depression rate
+burst_multiplier = 3.0        # LTP boost during burst
+newcomer_multiplier = 2.0     # LTP boost for newcomers
+weight_floor = 0.15           # Minimum coupling weight
+
+[bridges]
+k_mod_min = -0.5
+k_mod_max = 1.5
+k_mod_budget_min = 0.85       # Combined external influence floor
+k_mod_budget_max = 1.15       # Combined external influence ceiling
+synthex_poll_interval = 6     # Ticks (30s)
+nexus_poll_interval = 12      # Ticks (60s)
+me_poll_interval = 12         # Ticks (60s)
+povm_snapshot_interval = 12   # Ticks (60s)
+povm_weights_interval = 60    # Ticks (5min)
+rm_post_interval = 60         # Ticks (5min)
+vms_post_interval = 60        # Ticks (5min)
+
+[conductor]
+gain = 0.15                   # PI controller proportional gain
+breathing_blend = 0.3         # Emergent breathing contribution
+divergence_cooldown_ticks = 3 # Suppress coherence during divergence requests
+
+[ipc]
+socket_path = "/run/user/1000/pane-vortex-bus.sock"
+socket_permissions = 0o700
+max_connections = 50
+event_buffer_size = 256       # mpsc channel capacity
+task_ttl_secs = 3600          # Auto-expire tasks after 1 hour
+cascade_rate_limit = 10       # Max cascades per minute
+
+[persistence]
+snapshot_interval = 60        # Ticks between field snapshots
+wal_busy_timeout_ms = 5000
+bus_db_path = "data/bus_tracking.db"
+field_db_path = "data/field_tracking.db"
+
+[governance]
+proposal_voting_window_ticks = 5
+quorum_threshold = 0.5        # >50% of active spheres
+max_active_proposals = 10

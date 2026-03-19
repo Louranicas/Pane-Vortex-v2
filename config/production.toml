@@ -1,0 +1,10 @@
+# Production overrides — only differences from default.toml
+
+[server]
+# bind_addr = "0.0.0.0"  # Uncomment to allow external access
+
+[field]
+coupling_steps_per_tick = 20  # Higher for production stability
+
+[persistence]
+wal_busy_timeout_ms = 10000   # Longer timeout under load

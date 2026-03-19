@@ -1,0 +1,29 @@
+# Bacon configuration for Pane-Vortex
+# Copy to ~/claude-code-workspace/pane-vortex/bacon.toml when ready
+# Uses /tmp target dir to avoid polluting project (standard PV pattern)
+
+default_job = "check"
+
+[jobs.check]
+command = ["cargo", "check"]
+need_stdout = false
+env = { CARGO_TARGET_DIR = "/tmp/cargo-pane-vortex" }
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--", "-D", "warnings"]
+need_stdout = false
+env = { CARGO_TARGET_DIR = "/tmp/cargo-pane-vortex" }
+
+[jobs.pedantic]
+command = ["cargo", "clippy", "--", "-D", "warnings", "-W", "clippy::pedantic"]
+need_stdout = false
+env = { CARGO_TARGET_DIR = "/tmp/cargo-pane-vortex" }
+
+[jobs.test]
+command = ["cargo", "test", "--lib", "--release"]
+need_stdout = true
+env = { CARGO_TARGET_DIR = "/tmp/cargo-pane-vortex" }
+
+[jobs.gate]
+command = ["bash", "-c", "CARGO_TARGET_DIR=/tmp/cargo-pane-vortex cargo check 2>&1 | tail -5 && echo '--- CLIPPY ---' && CARGO_TARGET_DIR=/tmp/cargo-pane-vortex cargo clippy -- -D warnings 2>&1 | tail -5 && echo '--- PEDANTIC ---' && CARGO_TARGET_DIR=/tmp/cargo-pane-vortex cargo clippy -- -D warnings -W clippy::pedantic 2>&1 | tail -5 && echo '--- TEST ---' && CARGO_TARGET_DIR=/tmp/cargo-pane-vortex cargo test --lib --release 2>&1 | tail -10"]
+need_stdout = true
