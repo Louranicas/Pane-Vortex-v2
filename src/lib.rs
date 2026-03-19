@@ -3,6 +3,9 @@
 #![deny(clippy::expect_used)]
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
+#![allow(clippy::significant_drop_tightening)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::too_many_arguments)]
 
 //! # Pane-Vortex V2 — The Habitat Coordination Daemon
 //!
