@@ -69,6 +69,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tokio-test = "0.4"
 tempfile = "3"
 approx = "0.5"
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [[bench]]
 name = "tick_loop"
