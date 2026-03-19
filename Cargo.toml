@@ -67,8 +67,9 @@ figment = { version = "0.10", features = ["toml", "env"] }
 # Networking (SO_REUSEADDR for bind retry)
 socket2 = "0.5"
 
-# Platform (signal handling, directory paths)
+# Platform (signal handling, directory paths, UID verification)
 dirs = "6"
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

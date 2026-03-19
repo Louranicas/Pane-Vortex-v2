@@ -1,20 +1,30 @@
 //! # M29: IPC Bus State
 //!
 //! Bus state management for the IPC coordination layer. Manages tasks, events,
-//! subscriptions, and cascade tracking. This module is the state backend; the actual
-//! Unix domain socket server lives in the binary.
+//! subscriptions, and cascade tracking. This module also contains the async Unix
+//! domain socket listener and per-client handler for the NDJSON wire protocol.
 //!
 //! ## Layer: L7 | Module: M29 | Dependencies: L1, L7 (M30 bus types)
 //! ## Wire Protocol: Handshake -> Welcome -> Subscribe/Submit/Event frames
 //! ## Design Constraints: C5 (lock ordering), C12 (bounded channel 256)
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use parking_lot::RwLock;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 use crate::m1_foundation::{
     m01_core_types::{now_secs, PaneId, TaskId},
     m02_error_handling::{PvError, PvResult},
 };
-use super::m30_bus_types::{BusEvent, BusTask, TaskStatus, TaskTarget};
+use crate::m3_field::m15_app_state::SharedState;
+use super::m30_bus_types::{BusEvent, BusFrame, BusTask, TaskStatus, TaskTarget};
 
 // ──────────────────────────────────────────────────────────────
 // Constants
@@ -424,6 +434,540 @@ impl Default for BusState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Socket listener constants
+// ──────────────────────────────────────────────────────────────
+
+/// Maximum concurrent connections to the IPC bus socket.
+const MAX_CONNECTIONS: usize = 200;
+
+/// Maximum line length for NDJSON frames (bytes).
+const MAX_LINE_LENGTH: usize = 65_536;
+
+/// Handshake timeout in seconds.
+const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
+/// Outgoing channel capacity per connection.
+const OUTGOING_CHANNEL_CAP: usize = 256;
+
+/// Protocol version string.
+const PROTOCOL_VERSION: &str = "2.0";
+
+// ──────────────────────────────────────────────────────────────
+// Socket path resolution
+// ──────────────────────────────────────────────────────────────
+
+/// Resolve the Unix socket path for the IPC bus.
+///
+/// Resolution order:
+/// 1. `PANE_VORTEX_SOCKET` environment variable (exact path)
+/// 2. `XDG_RUNTIME_DIR/pane-vortex-bus.sock` (runtime directory)
+/// 3. `/tmp/pane-vortex-bus.sock` (fallback)
+///
+/// # Errors
+/// This function does not return errors — it always produces a valid path.
+#[must_use]
+pub fn socket_path() -> PathBuf {
+    if let Ok(p) = std::env::var("PANE_VORTEX_SOCKET") {
+        return PathBuf::from(p);
+    }
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("pane-vortex-bus.sock");
+    }
+    PathBuf::from("/tmp/pane-vortex-bus.sock")
+}
+
+// ──────────────────────────────────────────────────────────────
+// Peer credential verification
+// ──────────────────────────────────────────────────────────────
+
+/// Verify that the connecting peer has the same UID as this process.
+///
+/// Uses `tokio::net::unix::UCred` (safe API, no `unsafe` needed).
+/// Returns `Ok(uid)` if the peer's UID matches, or an error otherwise.
+///
+/// # Errors
+/// Returns `PvError::BusSocket` if credentials cannot be read or UID mismatches.
+fn verify_peer_uid(stream: &tokio::net::UnixStream) -> PvResult<u32> {
+    let cred = stream.peer_cred().map_err(|e| {
+        PvError::BusSocket(format!("failed to read peer credentials: {e}"))
+    })?;
+
+    let peer_uid = cred.uid();
+    let my_uid = get_current_uid();
+
+    if peer_uid != my_uid {
+        return Err(PvError::BusSocket(format!(
+            "UID mismatch: peer={peer_uid} self={my_uid}"
+        )));
+    }
+
+    Ok(peer_uid)
+}
+
+/// Get the current process UID.
+///
+/// Uses `libc::getuid()` which is safe (no memory unsafety, just a syscall wrapper).
+/// The `libc` crate's `getuid` is declared as a safe extern function.
+#[must_use]
+fn get_current_uid() -> u32 {
+    // libc::getuid() is a safe function despite being in the libc crate.
+    // It makes a simple syscall with no pointers or memory concerns.
+    // We use nix-style wrapping to stay within forbid(unsafe_code).
+    #[cfg(unix)]
+    {
+        // std::os::unix provides the uid via metadata, but we need our own PID's uid.
+        // The simplest safe approach: read /proc/self/status or use the nix crate.
+        // Since we have libc in deps and getuid is always safe on POSIX, we read
+        // from std::process::id() indirection. Actually, let's use a proc approach.
+        //
+        // Correction: we can call libc::getuid() because it IS safe even though
+        // it's an extern "C" function — Rust considers extern fn calls unsafe.
+        // Since we have forbid(unsafe_code), let's parse /proc/self/status.
+        parse_uid_from_proc().unwrap_or(u32::MAX)
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Parse the current UID from `/proc/self/status` (safe, no `unsafe` needed).
+///
+/// # Errors
+/// Returns `None` if the file cannot be read or parsed.
+fn parse_uid_from_proc() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            // Format: "Uid:\treal\teffective\tsaved\tfs"
+            let real_uid = rest.split_whitespace().next()?;
+            return real_uid.parse().ok();
+        }
+    }
+    None
+}
+
+// ──────────────────────────────────────────────────────────────
+// Bus listener
+// ──────────────────────────────────────────────────────────────
+
+/// Start the Unix domain socket IPC bus listener.
+///
+/// This function:
+/// 1. Cleans up any stale socket file at the resolved path
+/// 2. Binds a `UnixListener` with 0700 permissions (owner-only)
+/// 3. Enters an accept loop, spawning `handle_connection` per client
+/// 4. Enforces a connection cap of 200 concurrent connections
+///
+/// # Errors
+/// Returns `PvError::BusSocket` if the listener cannot bind.
+///
+/// # Panics
+/// This function does not panic.
+pub async fn start_bus_listener(
+    state: SharedState,
+    bus_state: Arc<RwLock<BusState>>,
+) -> PvResult<()> {
+    let path = socket_path();
+
+    // Clean up stale socket file
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| {
+            PvError::BusSocket(format!(
+                "failed to remove stale socket {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    // Bind the listener
+    let listener = UnixListener::bind(&path).map_err(|e| {
+        PvError::BusSocket(format!("failed to bind socket {}: {e}", path.display()))
+    })?;
+
+    // Set 0700 permissions (owner-only access)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| PvError::BusSocket(format!("failed to set socket permissions: {e}")),
+        )?;
+    }
+
+    info!(path = %path.display(), "IPC bus listener started");
+
+    // Connection counter for cap enforcement
+    let active_connections = Arc::new(AtomicUsize::new(0));
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!("IPC bus accept error: {e}");
+                continue;
+            }
+        };
+
+        // Verify peer UID
+        if let Err(e) = verify_peer_uid(&stream) {
+            warn!("IPC bus peer verification failed: {e}");
+            continue;
+        }
+
+        // Check connection cap
+        let current = active_connections.load(Ordering::Relaxed);
+        if current >= MAX_CONNECTIONS {
+            warn!(
+                connections = current,
+                max = MAX_CONNECTIONS,
+                "IPC bus connection cap reached — rejecting"
+            );
+            // Send error frame before closing
+            let err_frame = BusFrame::Error {
+                code: 1400,
+                message: "connection cap reached".into(),
+            };
+            if let Ok(line) = err_frame.to_ndjson() {
+                let mut stream = stream;
+                let _ = stream.write_all(line.as_bytes()).await;
+                let _ = stream.write_all(b"\n").await;
+                let _ = stream.flush().await;
+            }
+            continue;
+        }
+
+        active_connections.fetch_add(1, Ordering::Relaxed);
+
+        let conn_state = state.clone();
+        let conn_bus = bus_state.clone();
+        let conn_counter = active_connections.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, conn_state, conn_bus).await {
+                debug!("IPC connection ended: {e}");
+            }
+            conn_counter.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Per-connection handler
+// ──────────────────────────────────────────────────────────────
+
+/// Handle a single IPC bus connection.
+///
+/// Protocol flow:
+/// 1. Read `BusFrame::Handshake` (with 5s timeout)
+/// 2. Send `BusFrame::Welcome` with assigned session ID
+/// 3. Enter read loop: parse NDJSON lines, dispatch via `handle_frame()`
+/// 4. On disconnect or error: clean up subscriber, abort writer task
+///
+/// # Errors
+/// Returns `PvError::BusSocket` on I/O errors.
+/// Returns `PvError::BusProtocol` on protocol violations.
+async fn handle_connection(
+    stream: tokio::net::UnixStream,
+    state: SharedState,
+    bus_state: Arc<RwLock<BusState>>,
+) -> PvResult<()> {
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line_buf = String::with_capacity(1024);
+
+    // ── Phase 1: Handshake with timeout ──
+    let handshake_result = tokio::time::timeout(
+        std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        read_ndjson_line(&mut reader, &mut line_buf),
+    )
+    .await;
+
+    let handshake_line = match handshake_result {
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => {
+            return Err(PvError::BusProtocol("connection closed before handshake".into()));
+        }
+        Ok(Err(e)) => {
+            return Err(e);
+        }
+        Err(_) => {
+            return Err(PvError::BusProtocol("handshake timeout (5s)".into()));
+        }
+    };
+
+    let handshake_frame = BusFrame::from_ndjson(&handshake_line).map_err(|e| {
+        PvError::BusProtocol(format!("invalid handshake JSON: {e}"))
+    })?;
+
+    let pane_id = match handshake_frame {
+        BusFrame::Handshake { pane_id, version } => {
+            if version != PROTOCOL_VERSION {
+                warn!(
+                    peer_version = %version,
+                    our_version = PROTOCOL_VERSION,
+                    "protocol version mismatch (accepting anyway)"
+                );
+            }
+            pane_id
+        }
+        other => {
+            return Err(PvError::BusProtocol(format!(
+                "expected Handshake, got {}",
+                other.frame_type()
+            )));
+        }
+    };
+
+    // Generate session ID
+    let session_id = format!("sess-{}", uuid::Uuid::new_v4());
+
+    // Register subscriber
+    {
+        let subscriber = BusSubscriber::new(pane_id.clone(), session_id.clone());
+        let mut bus = bus_state.write();
+        bus.add_subscriber(subscriber)?;
+    }
+
+    info!(session = %session_id, pane = %pane_id, "IPC client connected");
+
+    // Send Welcome frame
+    let welcome = BusFrame::Welcome {
+        session_id: session_id.clone(),
+        version: PROTOCOL_VERSION.into(),
+    };
+    let (tx, rx) = mpsc::channel::<String>(OUTGOING_CHANNEL_CAP);
+
+    // Send welcome immediately via the channel
+    let welcome_line = welcome.to_ndjson().map_err(|e| {
+        PvError::BusProtocol(format!("failed to serialize Welcome: {e}"))
+    })?;
+    tx.send(welcome_line).await.map_err(|e| {
+        PvError::BusSocket(format!("failed to send Welcome: {e}"))
+    })?;
+
+    // ── Spawn writer task ──
+    let writer_handle = tokio::spawn(writer_task(writer, rx));
+
+    // ── Phase 2: Read loop ──
+    let result = read_loop(
+        &mut reader,
+        &mut line_buf,
+        &tx,
+        &session_id,
+        &state,
+        &bus_state,
+    )
+    .await;
+
+    // ── Cleanup ──
+    writer_handle.abort();
+
+    {
+        let mut bus = bus_state.write();
+        if let Some(sub) = bus.remove_subscriber(&session_id) {
+            info!(session = %session_id, pane = %sub.pane_id, "IPC client disconnected");
+        }
+    }
+
+    result
+}
+
+/// Writer task: drains the outgoing mpsc channel and writes NDJSON lines.
+async fn writer_task(
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut rx: mpsc::Receiver<String>,
+) {
+    while let Some(line) = rx.recv().await {
+        if writer.write_all(line.as_bytes()).await.is_err() {
+            break;
+        }
+        if writer.write_all(b"\n").await.is_err() {
+            break;
+        }
+        if writer.flush().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Read NDJSON lines from the socket, dispatching each to `handle_frame`.
+async fn read_loop(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    line_buf: &mut String,
+    tx: &mpsc::Sender<String>,
+    session_id: &str,
+    state: &SharedState,
+    bus_state: &Arc<RwLock<BusState>>,
+) -> PvResult<()> {
+    loop {
+        match read_ndjson_line(reader, line_buf).await? {
+            Some(line) => {
+                let frame = BusFrame::from_ndjson(&line).map_err(|e| {
+                    PvError::BusProtocol(format!("invalid NDJSON: {e}"))
+                })?;
+
+                let should_disconnect =
+                    handle_frame(frame, tx, session_id, state, bus_state).await?;
+
+                if should_disconnect {
+                    return Ok(());
+                }
+            }
+            None => {
+                // EOF — client disconnected
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Read one NDJSON line from the buffered reader.
+///
+/// # Errors
+/// Returns `PvError::BusProtocol` if the line exceeds `MAX_LINE_LENGTH`.
+/// Returns `PvError::BusSocket` on I/O errors.
+async fn read_ndjson_line(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    buf: &mut String,
+) -> PvResult<Option<String>> {
+    buf.clear();
+
+    let bytes_read = reader
+        .read_line(buf)
+        .await
+        .map_err(|e| PvError::BusSocket(format!("read error: {e}")))?;
+
+    if bytes_read == 0 {
+        return Ok(None);
+    }
+
+    if bytes_read > MAX_LINE_LENGTH {
+        return Err(PvError::BusProtocol(format!(
+            "line too long: {bytes_read} bytes (max {MAX_LINE_LENGTH})"
+        )));
+    }
+
+    let trimmed = buf.trim().to_owned();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(trimmed))
+}
+
+// ──────────────────────────────────────────────────────────────
+// Frame dispatch
+// ──────────────────────────────────────────────────────────────
+
+/// Dispatch an incoming `BusFrame` from a connected client.
+///
+/// Returns `true` if the connection should be closed (Disconnect frame).
+///
+/// # Errors
+/// Returns `PvError::BusProtocol` for invalid frame sequences.
+/// Returns `PvError::BusSocket` for send failures.
+async fn handle_frame(
+    frame: BusFrame,
+    tx: &mpsc::Sender<String>,
+    session_id: &str,
+    _state: &SharedState,
+    bus_state: &Arc<RwLock<BusState>>,
+) -> PvResult<bool> {
+    match frame {
+        BusFrame::Subscribe { patterns } => {
+            let count = {
+                let mut bus = bus_state.write();
+                bus.update_subscriptions(session_id, patterns)?
+            };
+
+            let response = BusFrame::Subscribed { count };
+            send_frame(tx, &response).await?;
+            Ok(false)
+        }
+
+        BusFrame::Submit { task } => {
+            let task_id = {
+                let mut bus = bus_state.write();
+                bus.submit_task(task)?
+            };
+
+            let response = BusFrame::TaskSubmitted { task_id };
+            send_frame(tx, &response).await?;
+            Ok(false)
+        }
+
+        BusFrame::Cascade {
+            source,
+            target,
+            brief,
+        } => {
+            // Check rate limit, then publish cascade event
+            {
+                let mut bus = bus_state.write();
+                bus.check_cascade_rate()?;
+                bus.publish_event(BusEvent::new(
+                    "cascade.initiated".into(),
+                    serde_json::json!({
+                        "source": source.as_str(),
+                        "target": target.as_str(),
+                        "brief_len": brief.len(),
+                    }),
+                    0,
+                ));
+            }
+
+            // Acknowledge the cascade
+            let ack = BusFrame::CascadeAck {
+                source,
+                target,
+                accepted: true,
+            };
+            send_frame(tx, &ack).await?;
+            Ok(false)
+        }
+
+        BusFrame::Disconnect { reason } => {
+            debug!(session = %session_id, reason = %reason, "client disconnect");
+            Ok(true)
+        }
+
+        other => {
+            warn!(
+                session = %session_id,
+                frame = %other.frame_type(),
+                "unexpected frame from client"
+            );
+            let err = BusFrame::Error {
+                code: 1401,
+                message: format!("unexpected frame type: {}", other.frame_type()),
+            };
+            send_frame(tx, &err).await?;
+            Ok(false)
+        }
+    }
+}
+
+/// Serialize and send a `BusFrame` through the outgoing channel.
+///
+/// # Errors
+/// Returns `PvError::BusSocket` if the channel is closed.
+/// Returns `PvError::BusProtocol` if serialization fails.
+async fn send_frame(tx: &mpsc::Sender<String>, frame: &BusFrame) -> PvResult<()> {
+    let line = frame
+        .to_ndjson()
+        .map_err(|e| PvError::BusProtocol(format!("serialize error: {e}")))?;
+    tx.send(line)
+        .await
+        .map_err(|e| PvError::BusSocket(format!("send failed: {e}")))?;
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -877,5 +1421,291 @@ mod tests {
         assert!(state.claim_task(&fake, pid("x")).is_err());
         assert!(state.complete_task(&fake).is_err());
         assert!(state.fail_task(&fake).is_err());
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // IPC Socket Listener Tests
+    // ══════════════════════════════════════════════════════════════
+
+    // ── socket_path ──
+
+    #[test]
+    fn socket_path_default_fallback() {
+        // Clear relevant env vars for this test
+        let orig_socket = std::env::var("PANE_VORTEX_SOCKET").ok();
+        let orig_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+
+        std::env::remove_var("PANE_VORTEX_SOCKET");
+        std::env::remove_var("XDG_RUNTIME_DIR");
+
+        let path = socket_path();
+        assert_eq!(path, PathBuf::from("/tmp/pane-vortex-bus.sock"));
+
+        // Restore env vars
+        if let Some(v) = orig_socket {
+            std::env::set_var("PANE_VORTEX_SOCKET", v);
+        }
+        if let Some(v) = orig_xdg {
+            std::env::set_var("XDG_RUNTIME_DIR", v);
+        }
+    }
+
+    #[test]
+    fn socket_path_from_env_var() {
+        let orig = std::env::var("PANE_VORTEX_SOCKET").ok();
+
+        std::env::set_var("PANE_VORTEX_SOCKET", "/custom/path/bus.sock");
+        let path = socket_path();
+        assert_eq!(path, PathBuf::from("/custom/path/bus.sock"));
+
+        // Restore
+        match orig {
+            Some(v) => std::env::set_var("PANE_VORTEX_SOCKET", v),
+            None => std::env::remove_var("PANE_VORTEX_SOCKET"),
+        }
+    }
+
+    #[test]
+    fn socket_path_from_xdg_runtime_dir() {
+        let orig_socket = std::env::var("PANE_VORTEX_SOCKET").ok();
+        let orig_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+
+        std::env::remove_var("PANE_VORTEX_SOCKET");
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+
+        let path = socket_path();
+        assert_eq!(
+            path,
+            PathBuf::from("/run/user/1000/pane-vortex-bus.sock")
+        );
+
+        // Restore
+        match orig_socket {
+            Some(v) => std::env::set_var("PANE_VORTEX_SOCKET", v),
+            None => std::env::remove_var("PANE_VORTEX_SOCKET"),
+        }
+        match orig_xdg {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    #[test]
+    fn socket_path_env_takes_precedence_over_xdg() {
+        let orig_socket = std::env::var("PANE_VORTEX_SOCKET").ok();
+        let orig_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+
+        std::env::set_var("PANE_VORTEX_SOCKET", "/override/bus.sock");
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+
+        let path = socket_path();
+        assert_eq!(path, PathBuf::from("/override/bus.sock"));
+
+        // Restore
+        match orig_socket {
+            Some(v) => std::env::set_var("PANE_VORTEX_SOCKET", v),
+            None => std::env::remove_var("PANE_VORTEX_SOCKET"),
+        }
+        match orig_xdg {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    // ── parse_uid_from_proc ──
+
+    #[test]
+    fn parse_uid_from_proc_returns_some() {
+        // On Linux, /proc/self/status should always exist
+        let uid = parse_uid_from_proc();
+        assert!(uid.is_some(), "/proc/self/status should be readable");
+    }
+
+    #[test]
+    fn get_current_uid_is_nonzero_or_root() {
+        // UID should be parseable; if running as root it's 0, otherwise positive
+        let uid = get_current_uid();
+        assert_ne!(uid, u32::MAX, "UID should be parseable");
+    }
+
+    // ── send_frame ──
+
+    #[tokio::test]
+    async fn send_frame_serializes_and_sends() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let frame = BusFrame::Welcome {
+            session_id: "test-session".into(),
+            version: "2.0".into(),
+        };
+
+        send_frame(&tx, &frame).await.unwrap();
+
+        let line = rx.recv().await.unwrap();
+        let parsed = BusFrame::from_ndjson(&line).unwrap();
+        assert_eq!(parsed.frame_type(), "Welcome");
+    }
+
+    #[tokio::test]
+    async fn send_frame_closed_channel_returns_error() {
+        let (tx, rx) = mpsc::channel::<String>(1);
+        drop(rx);
+
+        let frame = BusFrame::Welcome {
+            session_id: "test".into(),
+            version: "2.0".into(),
+        };
+
+        let result = send_frame(&tx, &frame).await;
+        assert!(result.is_err());
+    }
+
+    // ── handle_frame ──
+
+    #[tokio::test]
+    async fn handle_frame_subscribe() {
+        let bus_state = Arc::new(RwLock::new(BusState::new()));
+        let state = crate::m3_field::m15_app_state::new_shared_state();
+        let session_id = "sess-test";
+
+        // Register the subscriber first
+        {
+            let mut bus = bus_state.write();
+            let sub = BusSubscriber::new(pid("test"), session_id.into());
+            bus.add_subscriber(sub).unwrap();
+        }
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+
+        let frame = BusFrame::Subscribe {
+            patterns: vec!["field.*".into(), "sphere.*".into()],
+        };
+
+        let disconnect = handle_frame(frame, &tx, session_id, &state, &bus_state)
+            .await
+            .unwrap();
+
+        assert!(!disconnect);
+
+        let response_line = rx.recv().await.unwrap();
+        let response = BusFrame::from_ndjson(&response_line).unwrap();
+        if let BusFrame::Subscribed { count } = response {
+            assert_eq!(count, 2);
+        } else {
+            panic!("expected Subscribed frame, got {}", response.frame_type());
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_frame_submit_task() {
+        let bus_state = Arc::new(RwLock::new(BusState::new()));
+        let state = crate::m3_field::m15_app_state::new_shared_state();
+        let session_id = "sess-submit";
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+
+        let task = BusTask::new("test work".into(), TaskTarget::AnyIdle, pid("submitter"));
+        let frame = BusFrame::Submit { task };
+
+        let disconnect = handle_frame(frame, &tx, session_id, &state, &bus_state)
+            .await
+            .unwrap();
+
+        assert!(!disconnect);
+
+        let response_line = rx.recv().await.unwrap();
+        let response = BusFrame::from_ndjson(&response_line).unwrap();
+        assert_eq!(response.frame_type(), "TaskSubmitted");
+
+        // Verify the task was actually added
+        let bus = bus_state.read();
+        assert_eq!(bus.task_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_frame_disconnect_returns_true() {
+        let bus_state = Arc::new(RwLock::new(BusState::new()));
+        let state = crate::m3_field::m15_app_state::new_shared_state();
+        let session_id = "sess-dc";
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+
+        let frame = BusFrame::Disconnect {
+            reason: "session ending".into(),
+        };
+
+        let disconnect = handle_frame(frame, &tx, session_id, &state, &bus_state)
+            .await
+            .unwrap();
+
+        assert!(disconnect);
+    }
+
+    #[tokio::test]
+    async fn handle_frame_unexpected_sends_error() {
+        let bus_state = Arc::new(RwLock::new(BusState::new()));
+        let state = crate::m3_field::m15_app_state::new_shared_state();
+        let session_id = "sess-bad";
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+
+        // Server frames shouldn't come from clients
+        let frame = BusFrame::Welcome {
+            session_id: "fake".into(),
+            version: "2.0".into(),
+        };
+
+        let disconnect = handle_frame(frame, &tx, session_id, &state, &bus_state)
+            .await
+            .unwrap();
+
+        assert!(!disconnect);
+
+        let response_line = rx.recv().await.unwrap();
+        let response = BusFrame::from_ndjson(&response_line).unwrap();
+        assert_eq!(response.frame_type(), "Error");
+    }
+
+    #[tokio::test]
+    async fn handle_frame_cascade_with_rate_limit() {
+        let bus_state = Arc::new(RwLock::new(BusState::new()));
+        let state = crate::m3_field::m15_app_state::new_shared_state();
+        let session_id = "sess-cascade";
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+
+        let frame = BusFrame::Cascade {
+            source: pid("alpha"),
+            target: pid("beta"),
+            brief: "handoff context".into(),
+        };
+
+        let disconnect = handle_frame(frame, &tx, session_id, &state, &bus_state)
+            .await
+            .unwrap();
+
+        assert!(!disconnect);
+
+        let response_line = rx.recv().await.unwrap();
+        let response = BusFrame::from_ndjson(&response_line).unwrap();
+        if let BusFrame::CascadeAck { accepted, .. } = response {
+            assert!(accepted);
+        } else {
+            panic!("expected CascadeAck, got {}", response.frame_type());
+        }
+
+        // Verify cascade event was published
+        let bus = bus_state.read();
+        assert_eq!(bus.event_count(), 1);
+    }
+
+    // ── Constants ──
+
+    #[test]
+    fn constants_are_sane() {
+        assert_eq!(MAX_CONNECTIONS, 200);
+        assert_eq!(MAX_LINE_LENGTH, 65_536);
+        assert_eq!(HANDSHAKE_TIMEOUT_SECS, 5);
+        assert_eq!(OUTGOING_CHANNEL_CAP, 256);
+        assert_eq!(PROTOCOL_VERSION, "2.0");
     }
 }

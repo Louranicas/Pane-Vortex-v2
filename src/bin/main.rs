@@ -27,6 +27,7 @@ use pane_vortex::m1_foundation::{
 };
 use pane_vortex::m3_field::m15_app_state::{new_shared_state, SharedState};
 use pane_vortex::m4_coupling::m16_coupling_network::CouplingNetwork;
+use pane_vortex::m7_coordination::m29_ipc_bus::{start_bus_listener, BusState};
 use pane_vortex::m7_coordination::m31_conductor::Conductor;
 use pane_vortex::m7_coordination::m35_tick::tick_orchestrator;
 
@@ -361,6 +362,20 @@ async fn main() {
     // Spawn tick loop
     spawn_tick_loop(state.clone(), network.clone(), conductor, snap.clone());
 
+    // Create shared bus state (used by both IPC listener and API router)
+    let bus_state = Arc::new(RwLock::new(BusState::new()));
+
+    // Spawn IPC bus listener
+    {
+        let listener_state = state.clone();
+        let listener_bus = bus_state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = start_bus_listener(listener_state, listener_bus).await {
+                error!("IPC bus listener failed: {e}");
+            }
+        });
+    }
+
     // Spawn signal handler for graceful shutdown
     let shutdown_state = state.clone();
     let shutdown_snap = snap;
@@ -385,10 +400,18 @@ async fn main() {
 
     // Build API router
     #[cfg(feature = "api")]
-    let app = pane_vortex::m2_services::m10_api_server::build_router(state);
+    let app = {
+        let ctx = pane_vortex::m2_services::m10_api_server::AppContext {
+            state: state.clone(),
+            network: network.clone(),
+            bus: bus_state,
+        };
+        pane_vortex::m2_services::m10_api_server::build_router(ctx)
+    };
 
     #[cfg(not(feature = "api"))]
     let app = {
+        drop(bus_state);
         warn!("API feature disabled — no HTTP routes available");
         axum::Router::new()
     };

@@ -15,3 +15,6 @@ pub mod m10_api_server;
 pub use m07_service_registry::{ServiceDefinition, ServiceDefinitionBuilder, ServiceRegistry};
 pub use m08_health_monitor::{CircuitState, HealthMonitor, ServiceHealth};
 pub use m09_lifecycle::{LifecycleManager, ServiceLifecycle, ServiceState};
+
+#[cfg(feature = "api")]
+pub use m10_api_server::AppContext;
