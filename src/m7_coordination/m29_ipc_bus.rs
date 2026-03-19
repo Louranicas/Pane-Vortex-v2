@@ -674,6 +674,7 @@ pub async fn start_bus_listener(
 /// # Errors
 /// Returns `PvError::BusSocket` on I/O errors.
 /// Returns `PvError::BusProtocol` on protocol violations.
+#[allow(clippy::too_many_lines)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     state: SharedState,
@@ -703,27 +704,50 @@ async fn handle_connection(
         }
     };
 
-    let handshake_frame = BusFrame::from_ndjson(&handshake_line).map_err(|e| {
-        PvError::BusProtocol(format!("invalid handshake JSON: {e}"))
-    })?;
-
-    let pane_id = match handshake_frame {
-        BusFrame::Handshake { pane_id, version } => {
-            if version != PROTOCOL_VERSION {
-                warn!(
-                    peer_version = %version,
-                    our_version = PROTOCOL_VERSION,
-                    "protocol version mismatch (accepting anyway)"
-                );
+    // V1/V2 wire format compatibility: try V2 format first, then V1 fallback
+    let mut is_v1_client = false;
+    let pane_id = if let Ok(frame) = BusFrame::from_ndjson(&handshake_line) {
+        // V2 format: serde tagged enum
+        match frame {
+            BusFrame::Handshake { pane_id, version } => {
+                if version != PROTOCOL_VERSION {
+                    warn!(
+                        peer_version = %version,
+                        our_version = PROTOCOL_VERSION,
+                        "protocol version mismatch (accepting anyway)"
+                    );
+                }
+                pane_id
             }
-            pane_id
+            other => {
+                return Err(PvError::BusProtocol(format!(
+                    "expected Handshake, got {}",
+                    other.frame_type()
+                )));
+            }
         }
-        other => {
+    } else if let Ok(v1) = serde_json::from_str::<serde_json::Value>(&handshake_line) {
+        // V1 compat: {"type":"handshake","sphere_id":"..."}
+        let frame_type = v1.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if frame_type == "handshake" || frame_type == "Handshake" {
+            let sphere_id = v1
+                .get("sphere_id")
+                .or_else(|| v1.get("id"))
+                .or_else(|| v1.get("pane_id"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown");
+            info!(v1_compat = true, sphere_id, "V1 wire format handshake accepted");
+            is_v1_client = true;
+            PaneId::new(sphere_id)
+        } else {
             return Err(PvError::BusProtocol(format!(
-                "expected Handshake, got {}",
-                other.frame_type()
+                "unrecognized handshake format: type='{frame_type}'"
             )));
         }
+    } else {
+        return Err(PvError::BusProtocol(format!(
+            "invalid handshake JSON: {handshake_line}"
+        )));
     };
 
     // Generate session ID
@@ -738,17 +762,35 @@ async fn handle_connection(
 
     info!(session = %session_id, pane = %pane_id, "IPC client connected");
 
-    // Send Welcome frame
-    let welcome = BusFrame::Welcome {
-        session_id: session_id.clone(),
-        version: PROTOCOL_VERSION.into(),
-    };
+    // Send Welcome frame (V1 or V2 format based on client)
     let (tx, rx) = mpsc::channel::<String>(OUTGOING_CHANNEL_CAP);
 
     // Send welcome immediately via the channel
-    let welcome_line = welcome.to_ndjson().map_err(|e| {
-        PvError::BusProtocol(format!("failed to serialize Welcome: {e}"))
-    })?;
+    info!(is_v1_client, pane = %pane_id, "sending welcome response");
+    let welcome_line = if is_v1_client {
+        // V1 format: {"type":"handshake_ok","tick":N,"peer_count":N,"r":0.0,"protocol_version":1}
+        let (tick, peer_count) = {
+            let app = state.read();
+            let bus = bus_state.read();
+            (app.tick, bus.subscriber_count())
+        };
+        serde_json::to_string(&serde_json::json!({
+            "type": "HandshakeOk",
+            "tick": tick,
+            "peer_count": peer_count,
+            "r": 0.0,
+            "protocol_version": 1
+        })).unwrap_or_default()
+    } else {
+        // V2 format
+        let welcome = BusFrame::Welcome {
+            session_id: session_id.clone(),
+            version: PROTOCOL_VERSION.into(),
+        };
+        welcome.to_ndjson().map_err(|e| {
+            PvError::BusProtocol(format!("failed to serialize Welcome: {e}"))
+        })?
+    };
     tx.send(welcome_line).await.map_err(|e| {
         PvError::BusSocket(format!("failed to send Welcome: {e}"))
     })?;
@@ -810,9 +852,15 @@ async fn read_loop(
     loop {
         match read_ndjson_line(reader, line_buf).await? {
             Some(line) => {
-                let frame = BusFrame::from_ndjson(&line).map_err(|e| {
-                    PvError::BusProtocol(format!("invalid NDJSON: {e}"))
-                })?;
+                // V2 format first, then V1 compat fallback
+                let frame = if let Ok(f) = BusFrame::from_ndjson(&line) {
+                    f
+                } else if let Some(f) = parse_v1_frame(&line) {
+                    f
+                } else {
+                    warn!(line = %line.chars().take(100).collect::<String>(), "unparseable frame, skipping");
+                    continue;
+                };
 
                 let should_disconnect =
                     handle_frame(frame, tx, session_id, state, bus_state).await?;
@@ -825,6 +873,54 @@ async fn read_loop(
                 // EOF — client disconnected
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Parse a V1 wire format frame into a V2 `BusFrame`.
+///
+/// V1 uses `{"type":"subscribe","patterns":[...]}` style.
+/// V2 uses serde tagged enums `{"Subscribe":{"patterns":[...]}}`.
+fn parse_v1_frame(line: &str) -> Option<BusFrame> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let frame_type = v.get("type")?.as_str()?;
+
+    match frame_type {
+        "subscribe" | "Subscribe" => {
+            let patterns = v.get("patterns")?
+                .as_array()?
+                .iter()
+                .filter_map(|p| p.as_str().map(String::from))
+                .collect();
+            Some(BusFrame::Subscribe { patterns })
+        }
+        "disconnect" | "Disconnect" => {
+            let reason = v.get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("v1 disconnect")
+                .to_string();
+            Some(BusFrame::Disconnect { reason })
+        }
+        "ping" | "Ping" => {
+            // V1 sends ping for keepalive — map to Disconnect (harmless reconnect)
+            None // Skip pings, they're handled by the connection layer
+        }
+        "submit" | "TaskSubmit" => {
+            let desc = v.get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("v1 task")
+                .to_string();
+            let target = crate::m7_coordination::m30_bus_types::TaskTarget::AnyIdle;
+            let task = crate::m7_coordination::m30_bus_types::BusTask::new(
+                desc,
+                target,
+                PaneId::new("v1-client"),
+            );
+            Some(BusFrame::Submit { task })
+        }
+        _ => {
+            tracing::debug!(v1_type = frame_type, "unknown V1 frame type, skipping");
+            None
         }
     }
 }
