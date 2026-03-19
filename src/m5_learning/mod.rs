@@ -1,18 +1,17 @@
 //! # Layer 5: Learning
 //!
-//! Hebbian STDP, LTP/LTD, burst detection, buoy network.
+//! Hebbian STDP, buoy network analysis, and fleet-level memory management.
 //! Depends on L1 (Foundation), L3 (Field), L4 (Coupling).
-//!
-//! ## Design Constraints: C1 C11 C12
-//!
-//! ## Modules
-//!
-//! | Module | LOC Target | Purpose |
-//! |--------|-----------|---------|
-//! | `m19_hebbian_stdp` | ~300 | LTP=0.01, LTD=0.002, burst 3x, newcomer 2x |
-//! | `m20_buoy_network` | ~200 | 3D buoy positions, activation thresholds, pruning |
-//! | `m21_memory_manager` | ~250 | Sphere memory storage, amortised prune at MAX+50 |
 
 pub mod m19_hebbian_stdp;
 pub mod m20_buoy_network;
 pub mod m21_memory_manager;
+
+// ── Ergonomic re-exports ──
+
+pub use m19_hebbian_stdp::{apply_stdp, are_coactive, compute_ltp_rate, decay_all_weights, StdpResult};
+pub use m20_buoy_network::{buoy_centroid, buoy_health, fleet_buoy_stats, nearest_buoy, BuoyHealth, FleetBuoyStats};
+pub use m21_memory_manager::{
+    fleet_memory_stats, memory_age_distribution, shared_memories, sphere_top_tools,
+    tool_frequency, FleetMemoryStats, MemoryAgeDistribution,
+};
