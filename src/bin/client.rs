@@ -94,12 +94,22 @@ fn parse_args() -> Option<Cmd> {
             }
         }
         "submit" => {
-            let description = args.get(1).cloned().unwrap_or_else(|| "task".to_string());
-            let target = args
-                .iter()
-                .position(|a| a == "--target")
+            let target_pos = args.iter().position(|a| a == "--target");
+            let target = target_pos
                 .and_then(|i| args.get(i + 1).cloned())
                 .unwrap_or_else(|| "any-idle".to_string());
+            // Description is the first positional arg that isn't --target or its value
+            let description = args[1..]
+                .iter()
+                .enumerate()
+                .filter(|(i, a)| {
+                    *a != "--target"
+                        && target_pos.map_or(true, |tp| *i + 1 != tp + 1)
+                })
+                .map(|(_, a)| a.as_str())
+                .next()
+                .unwrap_or("task")
+                .to_string();
             Some(Cmd::Submit {
                 description,
                 target,
