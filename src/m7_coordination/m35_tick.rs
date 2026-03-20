@@ -113,6 +113,9 @@ pub fn tick_orchestrator(
     tick_coupling(state, network);
     timings.coupling_ms = p2_start.elapsed().as_secs_f64() * 1000.0;
 
+    // ── Phase 2.5: Hebbian STDP learning (BUG-031 fix) ──
+    tick_hebbian(state, network);
+
     // ── Phase 3: Field state computation ──
     let p3_start = Instant::now();
     let (field_state, decision) = tick_field_state(state, network, current_tick);
@@ -201,6 +204,21 @@ fn tick_coupling(state: &mut AppState, network: &mut CouplingNetwork) {
             sphere.phase = phase;
         }
     }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Phase 2.5: Hebbian STDP learning (BUG-031 fix)
+// ──────────────────────────────────────────────────────────────
+
+/// Apply Hebbian STDP to coupling network after coupling integration.
+///
+/// Co-active spheres (both Working) get LTP (+0.01, with burst/newcomer multipliers).
+/// Non-co-active pairs get LTD (-0.002). Weight floor enforced at 0.15.
+fn tick_hebbian(state: &AppState, network: &mut CouplingNetwork) {
+    if state.spheres.len() < 2 {
+        return;
+    }
+    let _result = crate::m5_learning::m19_hebbian_stdp::apply_stdp(network, &state.spheres);
 }
 
 // ──────────────────────────────────────────────────────────────
