@@ -60,6 +60,8 @@ pub struct BusSubscriber {
     pub session_id: String,
     /// Unix timestamp of last activity.
     pub last_active: f64,
+    /// Whether this subscriber uses V1 wire format (BUG-028 fix).
+    pub is_v1_client: bool,
 }
 
 impl BusSubscriber {
@@ -71,6 +73,7 @@ impl BusSubscriber {
             patterns: Vec::new(),
             session_id,
             last_active: now_secs(),
+            is_v1_client: false,
         }
     }
 
@@ -753,9 +756,10 @@ async fn handle_connection(
     // Generate session ID
     let session_id = format!("sess-{}", uuid::Uuid::new_v4());
 
-    // Register subscriber
+    // Register subscriber (with V1 compat flag for BUG-028 fix)
     {
-        let subscriber = BusSubscriber::new(pane_id.clone(), session_id.clone());
+        let mut subscriber = BusSubscriber::new(pane_id.clone(), session_id.clone());
+        subscriber.is_v1_client = is_v1_client;
         let mut bus = bus_state.write();
         bus.add_subscriber(subscriber)?;
     }
@@ -975,6 +979,7 @@ async fn read_ndjson_line(
 /// # Errors
 /// Returns `PvError::BusProtocol` for invalid frame sequences.
 /// Returns `PvError::BusSocket` for send failures.
+#[allow(clippy::too_many_lines)]
 async fn handle_frame(
     frame: BusFrame,
     tx: &mpsc::Sender<String>,
@@ -982,6 +987,15 @@ async fn handle_frame(
     _state: &SharedState,
     bus_state: &Arc<RwLock<BusState>>,
 ) -> PvResult<bool> {
+    // Check if this subscriber uses V1 wire format (BUG-028 fix)
+    let is_v1 = {
+        let bus = bus_state.read();
+        bus.subscribers
+            .iter()
+            .find(|(sid, _)| *sid == session_id)
+            .is_some_and(|(_, sub)| sub.is_v1_client)
+    };
+
     match frame {
         BusFrame::Subscribe { patterns } => {
             let count = {
@@ -989,8 +1003,20 @@ async fn handle_frame(
                 bus.update_subscriptions(session_id, patterns)?
             };
 
-            let response = BusFrame::Subscribed { count };
-            send_frame(tx, &response).await?;
+            if is_v1 {
+                // V1 format: {"type":"subscribed","count":N}
+                let line = serde_json::to_string(&serde_json::json!({
+                    "type": "subscribed",
+                    "count": count,
+                }))
+                .unwrap_or_default();
+                tx.send(line).await.map_err(|e| {
+                    PvError::BusSocket(format!("v1 send failed: {e}"))
+                })?;
+            } else {
+                let response = BusFrame::Subscribed { count };
+                send_frame(tx, &response).await?;
+            }
             Ok(false)
         }
 
@@ -1000,8 +1026,19 @@ async fn handle_frame(
                 bus.submit_task(task)?
             };
 
-            let response = BusFrame::TaskSubmitted { task_id };
-            send_frame(tx, &response).await?;
+            if is_v1 {
+                let line = serde_json::to_string(&serde_json::json!({
+                    "type": "task_submitted",
+                    "task_id": task_id.as_str(),
+                }))
+                .unwrap_or_default();
+                tx.send(line).await.map_err(|e| {
+                    PvError::BusSocket(format!("v1 send failed: {e}"))
+                })?;
+            } else {
+                let response = BusFrame::TaskSubmitted { task_id };
+                send_frame(tx, &response).await?;
+            }
             Ok(false)
         }
 
@@ -1010,7 +1047,6 @@ async fn handle_frame(
             target,
             brief,
         } => {
-            // Check rate limit, then publish cascade event
             {
                 let mut bus = bus_state.write();
                 bus.check_cascade_rate()?;
@@ -1025,13 +1061,25 @@ async fn handle_frame(
                 ));
             }
 
-            // Acknowledge the cascade
-            let ack = BusFrame::CascadeAck {
-                source,
-                target,
-                accepted: true,
-            };
-            send_frame(tx, &ack).await?;
+            if is_v1 {
+                let line = serde_json::to_string(&serde_json::json!({
+                    "type": "cascade_ack",
+                    "source": source.as_str(),
+                    "target": target.as_str(),
+                    "accepted": true,
+                }))
+                .unwrap_or_default();
+                tx.send(line).await.map_err(|e| {
+                    PvError::BusSocket(format!("v1 send failed: {e}"))
+                })?;
+            } else {
+                let ack = BusFrame::CascadeAck {
+                    source,
+                    target,
+                    accepted: true,
+                };
+                send_frame(tx, &ack).await?;
+            }
             Ok(false)
         }
 
