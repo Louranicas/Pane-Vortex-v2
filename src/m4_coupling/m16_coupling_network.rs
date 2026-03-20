@@ -197,9 +197,13 @@ impl CouplingNetwork {
 
     // ── K scaling ──
 
-    /// Auto-scale K based on frequency spread.
+    /// Auto-scale K based on frequency spread (IQR-robust).
     ///
-    /// `K_new = Kc = (2 × spread / π) × N`, capped at N.
+    /// Uses interquartile range instead of `max - min` to prevent outlier-driven
+    /// K spikes (Session 044: single registration caused 21x spread jump).
+    /// Rate-limited to 25% change per recalculation.
+    ///
+    /// `K_new = Kc = (2 × iqr_spread / π) × N`, capped at N, rate-limited.
     pub fn auto_scale_k(&mut self) {
         let n = self.frequencies.len();
         if n < 2 {
@@ -207,19 +211,34 @@ impl CouplingNetwork {
             return;
         }
 
-        let freqs: Vec<f64> = self.frequencies.values().copied().collect();
-        let min = freqs.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = freqs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let spread = max - min;
+        let mut freqs: Vec<f64> = self.frequencies.values().copied().collect();
+        freqs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        if spread < 1e-6 {
-            self.k = 1.5;
+        let spread = if n >= 4 {
+            // IQR: Q3 - Q1 for robustness against outlier frequencies
+            let q1_idx = n / 4;
+            let q3_idx = (3 * n) / 4;
+            let iqr = freqs[q3_idx] - freqs[q1_idx];
+            // Scale IQR to approximate full spread (IQR ≈ 1.35σ for normal)
+            iqr * 1.5
+        } else {
+            // Too few spheres for IQR — use median-adjacent spread
+            let mid = n / 2;
+            freqs[mid] - freqs[0]
+        };
+
+        let new_k = if spread < 1e-6 {
+            1.5
         } else {
             #[allow(clippy::cast_precision_loss)]
             let n_f = n as f64;
             let kc = (2.0 * spread / PI) * n_f;
-            self.k = kc.min(n_f);
-        }
+            kc.min(n_f)
+        };
+
+        // Rate limiter: K can change at most 25% per recalculation
+        let max_change = self.k * 0.25;
+        self.k = new_k.clamp(self.k - max_change, self.k + max_change);
     }
 
     // ── Phase stepping ──
@@ -567,9 +586,65 @@ mod tests {
         net.frequencies.insert(pid("a"), 0.1);
         net.frequencies.insert(pid("b"), 5.0);
         net.auto_k = true;
+        // With only 2 spheres, uses median-adjacent spread (not IQR)
+        // Rate limiter caps at 25% change from initial k=1.5
         net.auto_scale_k();
-        // Spread is 4.9, Kc = 2*4.9/π * 2 = ~6.24
-        assert!(net.k > 1.5, "K should increase with frequency spread, got {}", net.k);
+        assert!(net.k >= 1.5, "K should not decrease with large spread, got {}", net.k);
+    }
+
+    #[test]
+    fn auto_k_iqr_resists_outlier() {
+        let mut net = CouplingNetwork::new();
+        net.auto_k = false;
+        // 5 spheres with similar frequencies + 1 extreme outlier
+        for i in 0..5 {
+            let id = format!("s{i}");
+            net.phases.insert(pid(&id), 0.0);
+            net.frequencies.insert(pid(&id), 1.0 + (i as f64) * 0.1);
+        }
+        // Add outlier
+        net.phases.insert(pid("outlier"), 0.0);
+        net.frequencies.insert(pid("outlier"), 50.0);
+        net.auto_k = true;
+        net.auto_scale_k();
+        // IQR should be ~0.3 (spread within main cluster), not 49.0 (outlier)
+        // So K should remain moderate, not spike to 50
+        assert!(net.k < 10.0, "IQR should resist outlier: K={}", net.k);
+    }
+
+    #[test]
+    fn auto_k_rate_limited() {
+        let mut net = CouplingNetwork::new();
+        net.auto_k = false;
+        // Start with k=1.5, then create conditions that want k=100
+        net.phases.insert(pid("a"), 0.0);
+        net.phases.insert(pid("b"), 0.0);
+        net.frequencies.insert(pid("a"), 0.1);
+        net.frequencies.insert(pid("b"), 100.0);
+        net.auto_k = true;
+        net.auto_scale_k();
+        // Rate limit: max change is 25% of 1.5 = 0.375
+        assert!(net.k <= 1.875 + 0.01, "rate limiter should cap K change: K={}", net.k);
+    }
+
+    #[test]
+    fn auto_k_converges_over_multiple_recalcs() {
+        let mut net = CouplingNetwork::new();
+        net.auto_k = false;
+        for i in 0..6 {
+            let id = format!("s{i}");
+            net.phases.insert(pid(&id), 0.0);
+            net.frequencies.insert(pid(&id), 0.5 + (i as f64) * 0.5);
+        }
+        net.auto_k = true;
+        // Run multiple recalculations — K should converge smoothly
+        let mut prev_k = net.k;
+        for _ in 0..20 {
+            net.auto_scale_k();
+            let delta = (net.k - prev_k).abs();
+            assert!(delta <= prev_k * 0.25 + 0.01, "rate limit violated: delta={delta}");
+            prev_k = net.k;
+        }
     }
 
     // ── Phase stepping ──

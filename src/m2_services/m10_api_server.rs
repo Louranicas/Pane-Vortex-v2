@@ -7,7 +7,7 @@
 //! ## Module: M10
 //! ## Dependencies: L1 (M02, M03, M06), L3 (M15 `SharedState`), L4 (M16, M18), L7 (M29, M30)
 //!
-//! ## Route Groups (58 total)
+//! ## Route Groups (33 total)
 //!
 //! | Group | Count | Description |
 //! |-------|-------|-------------|
@@ -16,7 +16,7 @@
 //! | Sphere CRUD | 6 | `/sphere/{pane_id}/*` — register, deregister, memory, status, heartbeat |
 //! | Sphere Advanced | 4 | `/sphere/{pane_id}/neighbors`, inbox, send, ack |
 //! | Coupling | 2 | `/coupling/matrix`, `/coupling/weight` |
-//! | Bus | 3 | `/bus/info`, `/bus/tasks`, `/bus/events` |
+//! | Bus | 6 | `/bus/info`, `/bus/tasks`, `/bus/events`, `/bus/submit`, `/bus/cascade`, `/bus/cascades` |
 //! | Bridges | 1 | `/bridges/health` |
 
 use std::net::SocketAddr;
@@ -50,6 +50,8 @@ use crate::m3_field::{m11_sphere::PaneSphere, m12_field_state::FieldState};
 use crate::m4_coupling::m16_coupling_network::CouplingNetwork;
 use crate::m4_coupling::m18_topology::neighbors;
 use crate::m7_coordination::m29_ipc_bus::BusState;
+use crate::m7_coordination::m30_bus_types::{BusTask, TaskTarget};
+use crate::m7_coordination::m33_cascade::CascadeTracker;
 
 // ──────────────────────────────────────────────────────────────
 // AppContext — multi-state extractor
@@ -67,6 +69,8 @@ pub struct AppContext {
     pub network: Arc<RwLock<CouplingNetwork>>,
     /// IPC bus state (tasks, events, subscribers).
     pub bus: Arc<RwLock<BusState>>,
+    /// Cascade handoff tracker.
+    pub cascade: Arc<RwLock<CascadeTracker>>,
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -125,6 +129,35 @@ pub struct MessageRequest {
 pub struct AckRequest {
     /// Message ID to acknowledge.
     pub message_id: u64,
+}
+
+/// Request body for `POST /bus/submit`.
+#[derive(Debug, Deserialize)]
+pub struct TaskSubmitRequest {
+    /// Human-readable description of the work.
+    pub description: String,
+    /// Target strategy: `any_idle`, `field_driven`, `willing`, or `specific`.
+    #[serde(default = "default_target")]
+    pub target: String,
+    /// Submitter sphere ID.
+    pub submitter: String,
+    /// For "specific" target, the target sphere ID.
+    pub target_pane_id: Option<String>,
+}
+
+fn default_target() -> String {
+    "any_idle".to_owned()
+}
+
+/// Request body for `POST /bus/cascade`.
+#[derive(Debug, Deserialize)]
+pub struct CascadeRequest {
+    /// Source sphere ID.
+    pub source: String,
+    /// Target sphere ID.
+    pub target: String,
+    /// Markdown brief describing the work context.
+    pub brief: String,
 }
 
 /// Request body for `POST /sphere/{pane_id}/phase`.
@@ -457,7 +490,19 @@ async fn register_handler(
         }
     }
 
-    let sphere = PaneSphere::new(pid.clone(), body.persona.clone(), freq)?;
+    let mut sphere = PaneSphere::new(pid.clone(), body.persona.clone(), freq)?;
+
+    // Ghost reincarnation: if a ghost trace exists for this ID, restore its phase
+    let ghost_restored = {
+        let mut guard = ctx.state.write();
+        if let Some(ghost) = guard.accept_ghost(&pid) {
+            sphere.phase = ghost.phase_at_departure;
+            true
+        } else {
+            false
+        }
+    };
+
     let phase = sphere.phase;
 
     {
@@ -479,6 +524,7 @@ async fn register_handler(
             "registered": pane_id,
             "persona": body.persona,
             "frequency": freq,
+            "ghost_restored": ghost_restored,
         })),
     ))
 }
@@ -491,6 +537,21 @@ async fn deregister_handler(
     validate_pane_id(&pane_id)?;
     let pid = PaneId::new(&pane_id);
 
+    // Collect coupling neighbors BEFORE removing from network
+    let strongest_neighbors = {
+        let net = ctx.network.read();
+        let mut neighbor_weights: Vec<(String, f64)> = net
+            .connections
+            .iter()
+            .filter(|c| c.from == pid)
+            .map(|c| (c.to.as_str().to_owned(), c.weight * c.type_weight))
+            .collect();
+        neighbor_weights.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        neighbor_weights
+    };
+
     let ghost = {
         let mut guard = ctx.state.write();
         let sphere = guard
@@ -499,17 +560,30 @@ async fn deregister_handler(
             .ok_or_else(|| PvError::SphereNotFound(pane_id.clone()))?;
 
         let memory_count = sphere.memories.len();
+
+        // Compute top tools from memory frequency
+        let top_tools = {
+            let mut tool_counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for mem in &sphere.memories {
+                *tool_counts.entry(&mem.tool_name).or_insert(0) += 1;
+            }
+            let mut sorted: Vec<(&str, usize)> = tool_counts.into_iter().collect();
+            sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            sorted.into_iter().take(10).map(|(t, _)| t.to_owned()).collect()
+        };
+
         let ghost = GhostTrace {
             id: sphere.id,
             persona: sphere.persona,
             deregistered_at: guard.tick,
             total_steps_lived: sphere.total_steps,
             memory_count,
-            top_tools: Vec::new(),
+            top_tools,
             phase_at_departure: sphere.phase,
             receptivity: sphere.receptivity,
             work_signature: sphere.work_signature,
-            strongest_neighbors: Vec::new(),
+            strongest_neighbors,
         };
         guard.add_ghost(ghost.clone());
         guard.state_changes += 1;
@@ -978,6 +1052,115 @@ async fn bus_events_handler(State(ctx): State<AppContext>) -> impl IntoResponse 
     Json(serde_json::json!({ "events": events }))
 }
 
+/// POST /bus/submit -- Submit a task via HTTP (alternative to IPC socket).
+async fn bus_submit_handler(
+    State(ctx): State<AppContext>,
+    Json(body): Json<TaskSubmitRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let submitter = PaneId::new(body.submitter);
+    let target = match body.target.to_lowercase().as_str() {
+        "any_idle" | "anyidle" => TaskTarget::AnyIdle,
+        "field_driven" | "fielddriven" => TaskTarget::FieldDriven,
+        "willing" => TaskTarget::Willing,
+        "specific" => {
+            let pane_id = body.target_pane_id.ok_or_else(|| {
+                PvError::ConfigValidation(
+                    "target_pane_id required for specific target".into(),
+                )
+            })?;
+            TaskTarget::Specific {
+                pane_id: PaneId::new(pane_id),
+            }
+        }
+        other => {
+            return Err(ApiError(PvError::ConfigValidation(
+                format!("unknown target: {other}, expected any_idle|field_driven|willing|specific"),
+            )));
+        }
+    };
+
+    let task = BusTask::new(body.description, target, submitter);
+    let task_id = {
+        let mut bus = ctx.bus.write();
+        bus.submit_task(task)?
+    };
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "task_id": task_id.as_str(),
+            "status": "Pending",
+        })),
+    ))
+}
+
+/// POST /bus/cascade -- Initiate a cascade handoff via HTTP.
+async fn bus_cascade_handler(
+    State(ctx): State<AppContext>,
+    Json(body): Json<CascadeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let source = PaneId::new(body.source);
+    let target = PaneId::new(body.target);
+
+    let index = {
+        let mut cascade = ctx.cascade.write();
+        cascade.initiate(source.clone(), target.clone(), body.brief)?
+    };
+
+    // Publish cascade event to bus
+    {
+        use crate::m7_coordination::m30_bus_types::BusEvent;
+        let tick = {
+            let guard = ctx.state.read();
+            guard.tick
+        };
+        let event = BusEvent::new(
+            "cascade.initiated".into(),
+            serde_json::json!({
+                "source": source.as_str(),
+                "target": target.as_str(),
+                "index": index,
+            }),
+            tick,
+        );
+        let mut bus = ctx.bus.write();
+        bus.publish_event(event);
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "cascade_index": index,
+            "source": source.as_str(),
+            "target": target.as_str(),
+            "status": "dispatched",
+        })),
+    ))
+}
+
+/// GET /bus/cascades -- List pending cascades.
+async fn bus_cascades_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
+    let cascades = {
+        let tracker = ctx.cascade.read();
+        tracker
+            .pending_cascades()
+            .iter()
+            .map(|(idx, c)| {
+                serde_json::json!({
+                    "index": idx,
+                    "source": c.source.as_str(),
+                    "target": c.target.as_str(),
+                    "brief_len": c.brief.len(),
+                    "depth": c.depth,
+                    "elapsed_secs": c.elapsed_secs(),
+                })
+            })
+            .collect::<Vec<serde_json::Value>>()
+    };
+
+    Json(serde_json::json!({ "cascades": cascades }))
+}
+
 // ──────────────────────────────────────────────────────────────
 // Bridge handlers (1)
 // ──────────────────────────────────────────────────────────────
@@ -1000,14 +1183,227 @@ async fn bridges_health_handler(State(ctx): State<AppContext>) -> impl IntoRespo
 }
 
 // ──────────────────────────────────────────────────────────────
+// Governance handlers (feature-gated)
+// ──────────────────────────────────────────────────────────────
+
+/// Request body for `POST /field/propose`.
+#[cfg(feature = "governance")]
+#[derive(Debug, Deserialize)]
+pub struct ProposeRequest {
+    /// Proposer sphere ID.
+    pub proposer: String,
+    /// Parameter to change: `r_target`, `k_mod_budget_max`, or `coupling_steps`.
+    pub parameter: String,
+    /// Proposed value.
+    pub value: f64,
+    /// Human-readable reason.
+    pub reason: String,
+}
+
+/// Request body for `POST /sphere/{pane_id}/vote/{proposal_id}`.
+#[cfg(feature = "governance")]
+#[derive(Debug, Deserialize)]
+pub struct VoteRequest {
+    /// Vote choice: `approve`, `reject`, or `abstain`.
+    pub choice: String,
+}
+
+/// POST `/field/propose` -- Submit a governance proposal.
+#[cfg(feature = "governance")]
+async fn propose_handler(
+    State(ctx): State<AppContext>,
+    Json(body): Json<ProposeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::m8_governance::m37_proposals::ProposableParameter;
+
+    validate_pane_id(&body.proposer)?;
+
+    let parameter = match body.parameter.as_str() {
+        "r_target" => ProposableParameter::RTarget,
+        "k_mod_budget_max" => ProposableParameter::KModBudgetMax,
+        "coupling_steps" => ProposableParameter::CouplingSteps,
+        "opt_out_policy" => ProposableParameter::OptOutPolicy,
+        other if other.starts_with("sphere_override:") => {
+            let target = other.strip_prefix("sphere_override:").unwrap_or("");
+            ProposableParameter::SphereOverride {
+                target_sphere: target.to_owned(),
+            }
+        }
+        other => {
+            return Err(PvError::ConfigValidation(format!(
+                "unknown parameter: {other}"
+            ))
+            .into());
+        }
+    };
+
+    let current_value = match &parameter {
+        ProposableParameter::RTarget => m04_constants::R_TARGET_BASE,
+        ProposableParameter::KModBudgetMax => m04_constants::K_MOD_BUDGET_MAX,
+        ProposableParameter::CouplingSteps => {
+            #[allow(clippy::cast_precision_loss)]
+            let v = m04_constants::COUPLING_STEPS_PER_TICK as f64;
+            v
+        }
+        ProposableParameter::SphereOverride { .. } => 1.0,
+        ProposableParameter::OptOutPolicy => 0.0,
+    };
+
+    let proposal_id = {
+        let mut guard = ctx.state.write();
+        let tick = guard.tick;
+        guard.proposal_manager.submit(
+            PaneId::new(&body.proposer),
+            parameter,
+            body.value,
+            current_value,
+            body.reason.clone(),
+            tick,
+        )?
+    };
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "proposal_id": proposal_id,
+            "parameter": body.parameter,
+            "proposed_value": body.value,
+            "current_value": current_value,
+        })),
+    ))
+}
+
+/// POST `/sphere/{pane_id}/vote/{proposal_id}` -- Vote on a proposal.
+#[cfg(feature = "governance")]
+async fn vote_handler(
+    State(ctx): State<AppContext>,
+    Path((pane_id, proposal_id)): Path<(String, String)>,
+    Json(body): Json<VoteRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::m8_governance::m37_proposals::VoteChoice;
+
+    validate_pane_id(&pane_id)?;
+
+    let choice = match body.choice.as_str() {
+        "approve" => VoteChoice::Approve,
+        "reject" => VoteChoice::Reject,
+        "abstain" => VoteChoice::Abstain,
+        other => {
+            return Err(
+                PvError::ConfigValidation(format!("unknown vote choice: {other}")).into(),
+            );
+        }
+    };
+
+    {
+        let mut guard = ctx.state.write();
+        let tick = guard.tick;
+        guard
+            .proposal_manager
+            .vote(&proposal_id, PaneId::new(&pane_id), choice, tick)?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "proposal_id": proposal_id,
+        "voter": pane_id,
+        "choice": body.choice,
+    })))
+}
+
+/// GET `/field/proposals` -- List all proposals.
+#[cfg(feature = "governance")]
+async fn proposals_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
+    let proposals: Vec<serde_json::Value> = {
+        let guard = ctx.state.read();
+        guard
+            .proposal_manager
+            .all()
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "proposer": p.proposer.as_str(),
+                    "parameter": format!("{:?}", p.parameter),
+                    "proposed_value": p.proposed_value,
+                    "current_value": p.current_value,
+                    "reason": p.reason,
+                    "status": format!("{:?}", p.status),
+                    "votes": p.votes.len(),
+                    "submitted_at_tick": p.submitted_at_tick,
+                })
+            })
+            .collect()
+    };
+
+    Json(serde_json::json!({ "proposals": proposals }))
+}
+
+/// GET `/sphere/{pane_id}/consent` -- Get sphere consent posture.
+#[cfg(feature = "governance")]
+async fn sphere_consent_handler(
+    State(ctx): State<AppContext>,
+    Path(pane_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_pane_id(&pane_id)?;
+    let pid = PaneId::new(&pane_id);
+
+    let consent_info = {
+        let guard = ctx.state.read();
+        let sphere = guard
+            .spheres
+            .get(&pid)
+            .ok_or_else(|| PvError::SphereNotFound(pane_id.clone()))?;
+        serde_json::json!({
+            "pane_id": pane_id,
+            "opt_out_hebbian": sphere.opt_out_hebbian,
+            "opt_out_cross_activation": sphere.opt_out_cross_activation,
+            "opt_out_external_modulation": sphere.opt_out_external_modulation,
+            "opt_out_observation": sphere.opt_out_observation,
+            "receptivity": sphere.receptivity,
+            "preferred_r": sphere.preferred_r,
+        })
+    };
+
+    Ok(Json(consent_info))
+}
+
+/// GET `/sphere/{pane_id}/data-manifest` -- Data sovereignty manifest.
+#[cfg(feature = "governance")]
+async fn data_manifest_handler(
+    State(ctx): State<AppContext>,
+    Path(pane_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_pane_id(&pane_id)?;
+    let pid = PaneId::new(&pane_id);
+
+    let manifest = {
+        let guard = ctx.state.read();
+        let sphere = guard
+            .spheres
+            .get(&pid)
+            .ok_or_else(|| PvError::SphereNotFound(pane_id.clone()))?;
+        serde_json::json!({
+            "pane_id": pane_id,
+            "memories_count": sphere.memories.len(),
+            "buoys_count": sphere.buoys.len(),
+            "inbox_count": sphere.inbox.len(),
+            "total_steps": sphere.total_steps,
+            "registered_at": sphere.registered_at,
+        })
+    };
+
+    Ok(Json(manifest))
+}
+
+// ──────────────────────────────────────────────────────────────
 // Router construction
 // ──────────────────────────────────────────────────────────────
 
-/// Build the axum router with all 27 routes across 7 groups.
+/// Build the axum router with routes across all groups.
 ///
 /// Takes the full `AppContext` so handlers can access state, network, and bus.
 pub fn build_router(ctx: AppContext) -> Router {
-    Router::new()
+    let router = Router::new()
         // Core (3)
         .route("/health", get(health_handler))
         .route("/spheres", get(spheres_handler))
@@ -1040,14 +1436,32 @@ pub fn build_router(ctx: AppContext) -> Router {
         // Coupling (2)
         .route("/coupling/matrix", get(coupling_matrix_handler))
         .route("/coupling/weight", post(coupling_weight_handler))
-        // Bus (3)
+        // Bus (6)
         .route("/bus/info", get(bus_info_handler))
         .route("/bus/tasks", get(bus_tasks_handler))
         .route("/bus/events", get(bus_events_handler))
+        .route("/bus/submit", post(bus_submit_handler))
+        .route("/bus/cascade", post(bus_cascade_handler))
+        .route("/bus/cascades", get(bus_cascades_handler))
         // Bridges (1)
-        .route("/bridges/health", get(bridges_health_handler))
-        .layer(CorsLayer::permissive())
-        .with_state(ctx)
+        .route("/bridges/health", get(bridges_health_handler));
+
+    // Governance routes (feature-gated)
+    #[cfg(feature = "governance")]
+    let router = router
+        .route("/field/propose", post(propose_handler))
+        .route("/field/proposals", get(proposals_handler))
+        .route(
+            "/sphere/{pane_id}/vote/{proposal_id}",
+            post(vote_handler),
+        )
+        .route("/sphere/{pane_id}/consent", get(sphere_consent_handler))
+        .route(
+            "/sphere/{pane_id}/data-manifest",
+            get(data_manifest_handler),
+        );
+
+    router.layer(CorsLayer::permissive()).with_state(ctx)
 }
 
 /// Build the socket address from config.
@@ -1078,6 +1492,7 @@ mod tests {
             state: new_shared_state(),
             network: Arc::new(RwLock::new(CouplingNetwork::new())),
             bus: Arc::new(RwLock::new(BusState::new())),
+            cascade: Arc::new(RwLock::new(CascadeTracker::new())),
         }
     }
 
@@ -1696,5 +2111,941 @@ mod tests {
     #[test]
     fn parse_status_invalid() {
         assert!(parse_status("Unknown").is_err());
+    }
+
+    // ── Bus submit tests ──
+
+    #[tokio::test]
+    async fn bus_submit_creates_task() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app,
+            "/bus/submit",
+            serde_json::json!({
+                "description": "test task from HTTP",
+                "target": "any_idle",
+                "submitter": "http-test"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(json.get("task_id").is_some());
+        assert_eq!(json["status"], "Pending");
+
+        // Verify task appears in bus
+        let app2 = build_router(ctx);
+        let (_, tasks_json) = get_json(app2, "/bus/tasks").await;
+        assert_eq!(tasks_json["tasks"].as_array().map_or(0, Vec::len), 1);
+    }
+
+    #[tokio::test]
+    async fn bus_submit_field_driven() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, json) = post_json(
+            app,
+            "/bus/submit",
+            serde_json::json!({
+                "description": "field-driven task",
+                "target": "field_driven",
+                "submitter": "test-sphere"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(json.get("task_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn bus_submit_specific_target() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, json) = post_json(
+            app,
+            "/bus/submit",
+            serde_json::json!({
+                "description": "specific task",
+                "target": "specific",
+                "submitter": "test",
+                "target_pane_id": "target-sphere"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(json.get("task_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn bus_submit_specific_missing_pane_id() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, _) = post_json(
+            app,
+            "/bus/submit",
+            serde_json::json!({
+                "description": "bad task",
+                "target": "specific",
+                "submitter": "test"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn bus_submit_invalid_target() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, _) = post_json(
+            app,
+            "/bus/submit",
+            serde_json::json!({
+                "description": "bad target",
+                "target": "nonexistent",
+                "submitter": "test"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── Cascade tests ──
+
+    #[tokio::test]
+    async fn bus_cascade_creates_handoff() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app,
+            "/bus/cascade",
+            serde_json::json!({
+                "source": "tab4-left",
+                "target": "tab5-left",
+                "brief": "Continue V3.2 inhabitation work"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(json.get("cascade_index").is_some());
+        assert_eq!(json["status"], "dispatched");
+
+        // Verify cascade appears in list
+        let app2 = build_router(ctx.clone());
+        let (_, cascades_json) = get_json(app2, "/bus/cascades").await;
+        assert_eq!(cascades_json["cascades"].as_array().map_or(0, Vec::len), 1);
+
+        // Verify event was published
+        let app3 = build_router(ctx);
+        let (_, events_json) = get_json(app3, "/bus/events").await;
+        let events = events_json["events"].as_array().expect("events array");
+        assert!(!events.is_empty());
+        assert_eq!(events[0]["event_type"], "cascade.initiated");
+    }
+
+    #[tokio::test]
+    async fn bus_cascades_empty() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, json) = get_json(app, "/bus/cascades").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["cascades"].as_array().map_or(false, Vec::is_empty));
+    }
+
+    // ── Ghost reincarnation tests ──
+
+    #[tokio::test]
+    async fn register_restores_ghost_phase() {
+        let ctx = test_ctx();
+        // Register and deregister to create a ghost
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/reborn-test/register",
+            serde_json::json!({ "persona": "mortal", "frequency": 0.1 }),
+        )
+        .await;
+
+        // Set a known phase before departure
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/reborn-test/phase",
+            serde_json::json!({ "phase": 2.5 }),
+        )
+        .await;
+
+        // Deregister (creates ghost with phase_at_departure ≈ 2.5)
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/reborn-test/deregister",
+            serde_json::json!({}),
+        )
+        .await;
+
+        // Re-register with same ID — should restore ghost phase
+        let app = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app,
+            "/sphere/reborn-test/register",
+            serde_json::json!({ "persona": "immortal", "frequency": 0.1 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json["ghost_restored"], true);
+
+        // Ghost should be consumed (not in ghosts list)
+        let app = build_router(ctx);
+        let (_, ghosts_json) = get_json(app, "/ghosts").await;
+        let ghosts = ghosts_json["ghosts"].as_array().expect("ghosts");
+        let found = ghosts.iter().any(|g| g["id"] == "reborn-test");
+        assert!(!found, "ghost should be consumed after reincarnation");
+    }
+
+    #[tokio::test]
+    async fn register_no_ghost_returns_false() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, json) = post_json(
+            app,
+            "/sphere/fresh-test/register",
+            serde_json::json!({ "persona": "new-soul", "frequency": 0.1 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json["ghost_restored"], false);
+    }
+
+    // ── Ghost enrichment tests ──
+
+    #[tokio::test]
+    async fn deregister_enriches_ghost_top_tools() {
+        let ctx = test_ctx();
+        // Register
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/enrich-test/register",
+            serde_json::json!({ "persona": "enricher", "frequency": 0.1 }),
+        )
+        .await;
+
+        // Record some memories
+        for tool in &["Read", "Edit", "Read", "Bash", "Read"] {
+            let app = build_router(ctx.clone());
+            post_json(
+                app,
+                "/sphere/enrich-test/memory",
+                serde_json::json!({ "tool_name": tool, "summary": "test" }),
+            )
+            .await;
+        }
+
+        // Deregister
+        let app = build_router(ctx.clone());
+        post_json(app, "/sphere/enrich-test/deregister", serde_json::json!({})).await;
+
+        // Check ghost has top tools
+        let app = build_router(ctx);
+        let (_, json) = get_json(app, "/ghosts").await;
+        let ghosts = json["ghosts"].as_array().expect("ghosts");
+        assert!(!ghosts.is_empty());
+        let ghost = &ghosts[0];
+        let top_tools = ghost["top_tools"].as_array().expect("top_tools");
+        assert!(!top_tools.is_empty(), "ghost should have top_tools");
+        assert_eq!(top_tools[0], "Read", "most-used tool should be first");
+    }
+
+    #[tokio::test]
+    async fn deregister_enriches_ghost_neighbors() {
+        let ctx = test_ctx();
+        // Register two spheres so there are coupling connections
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/nb-a/register",
+            serde_json::json!({ "persona": "alpha", "frequency": 0.1 }),
+        )
+        .await;
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/nb-b/register",
+            serde_json::json!({ "persona": "beta", "frequency": 0.2 }),
+        )
+        .await;
+
+        // Deregister nb-a — should capture nb-b as neighbor
+        let app = build_router(ctx.clone());
+        post_json(app, "/sphere/nb-a/deregister", serde_json::json!({})).await;
+
+        // Check ghost has strongest_neighbors from ghosts endpoint
+        let guard = ctx.state.read();
+        let ghost = guard.ghosts.iter().find(|g| g.id.as_str() == "nb-a");
+        assert!(ghost.is_some(), "ghost should exist");
+        let ghost = ghost.expect("ghost");
+        assert!(
+            !ghost.strongest_neighbors.is_empty(),
+            "ghost should have neighbors"
+        );
+    }
+
+    // ── Phase handler tests ──
+
+    #[tokio::test]
+    async fn phase_handler_updates_phase() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/ph-test/register",
+            serde_json::json!({ "persona": "phase-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app2,
+            "/sphere/ph-test/phase",
+            serde_json::json!({ "phase": 1.57 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["pane_id"], "ph-test");
+        let returned_phase = json["phase"].as_f64().expect("phase");
+        assert!((returned_phase - 1.57).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn phase_handler_updates_frequency() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/pf-test/register",
+            serde_json::json!({ "persona": "freq-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app2,
+            "/sphere/pf-test/phase",
+            serde_json::json!({ "frequency": 0.5 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let returned_freq = json["frequency"].as_f64().expect("frequency");
+        assert!((returned_freq - 0.5).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn phase_handler_updates_both() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/pb-test/register",
+            serde_json::json!({ "persona": "both-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app2,
+            "/sphere/pb-test/phase",
+            serde_json::json!({ "phase": 3.14, "frequency": 0.3 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["phase"].as_f64().is_some());
+        assert!(json["frequency"].as_f64().is_some());
+    }
+
+    #[tokio::test]
+    async fn phase_handler_wraps_phase() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/pw-test/register",
+            serde_json::json!({ "persona": "wrap-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app2,
+            "/sphere/pw-test/phase",
+            serde_json::json!({ "phase": 7.0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let phase = json["phase"].as_f64().expect("phase");
+        assert!(phase >= 0.0 && phase < std::f64::consts::TAU);
+    }
+
+    #[tokio::test]
+    async fn phase_handler_negative_phase_wraps() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/pn-test/register",
+            serde_json::json!({ "persona": "neg-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app2,
+            "/sphere/pn-test/phase",
+            serde_json::json!({ "phase": -1.0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let phase = json["phase"].as_f64().expect("phase");
+        assert!(phase >= 0.0 && phase < std::f64::consts::TAU);
+    }
+
+    #[tokio::test]
+    async fn phase_handler_null_phase_is_noop() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/null-test/register",
+            serde_json::json!({ "persona": "null-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        // JSON null → Option<f64>::None → no-op
+        let app2 = build_router(ctx.clone());
+        let (status, _) = post_json(
+            app2,
+            "/sphere/null-test/phase",
+            serde_json::json!({ "phase": null }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn phase_handler_syncs_to_coupling_network() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/sync-test/register",
+            serde_json::json!({ "persona": "sync-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        // Change frequency and verify coupling network picks it up
+        let app2 = build_router(ctx.clone());
+        let (status, _) = post_json(
+            app2,
+            "/sphere/sync-test/phase",
+            serde_json::json!({ "frequency": 0.5 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let net = ctx.network.read();
+        let pid = PaneId::new("sync-test");
+        if let Some(&freq) = net.frequencies.get(&pid) {
+            assert!((freq - 0.5).abs() < 0.01);
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_handler_sphere_not_found() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, _) = post_json(
+            app,
+            "/sphere/nonexistent/phase",
+            serde_json::json!({ "phase": 1.0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn phase_handler_empty_body_ok() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/pe-test/register",
+            serde_json::json!({ "persona": "empty-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        // No phase or frequency — should still succeed (no-op)
+        let app2 = build_router(ctx.clone());
+        let (status, _) = post_json(
+            app2,
+            "/sphere/pe-test/phase",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // ── Steer handler tests ──
+
+    #[tokio::test]
+    async fn steer_handler_steers_phase() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/st-test/register",
+            serde_json::json!({ "persona": "steer-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app2,
+            "/sphere/st-test/steer",
+            serde_json::json!({ "target_phase": 3.14, "strength": 0.5 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["pane_id"], "st-test");
+        let target = json["target_phase"].as_f64().expect("target_phase");
+        assert!(target >= 0.0 && target < std::f64::consts::TAU);
+    }
+
+    #[tokio::test]
+    async fn steer_handler_clamps_strength() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/sc-test/register",
+            serde_json::json!({ "persona": "clamp-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app2,
+            "/sphere/sc-test/steer",
+            serde_json::json!({ "target_phase": 1.0, "strength": 5.0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let strength = json["strength"].as_f64().expect("strength");
+        assert!((strength - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn steer_handler_negative_strength_clamps() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/sn-test/register",
+            serde_json::json!({ "persona": "neg-str-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app2,
+            "/sphere/sn-test/steer",
+            serde_json::json!({ "target_phase": 1.0, "strength": -1.0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let strength = json["strength"].as_f64().expect("strength");
+        assert!(strength >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn steer_handler_null_target_rejected() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/snan-test/register",
+            serde_json::json!({ "persona": "nan-steer", "frequency": 0.1 }),
+        )
+        .await;
+
+        // target_phase is required (f64, not Option<f64>), null → 422
+        let app2 = build_router(ctx.clone());
+        let (status, _) = post_json(
+            app2,
+            "/sphere/snan-test/steer",
+            serde_json::json!({ "target_phase": null, "strength": 0.5 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn steer_handler_sphere_not_found() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, _) = post_json(
+            app,
+            "/sphere/nonexistent/steer",
+            serde_json::json!({ "target_phase": 1.0, "strength": 0.5 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn steer_handler_wraps_target_phase() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/sw-test/register",
+            serde_json::json!({ "persona": "wrap-steer", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app2,
+            "/sphere/sw-test/steer",
+            serde_json::json!({ "target_phase": 10.0, "strength": 0.5 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let target = json["target_phase"].as_f64().expect("target_phase");
+        assert!(target >= 0.0 && target < std::f64::consts::TAU);
+    }
+
+    // ── Bus suggestions handler tests ──
+
+    #[tokio::test]
+    async fn bus_suggestions_returns_200() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, json) = get_json(app, "/bus/suggestions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["suggestions"].is_array());
+        assert_eq!(json["total_generated"], 0);
+    }
+
+    #[tokio::test]
+    async fn bus_suggestions_empty_array() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (_, json) = get_json(app, "/bus/suggestions").await;
+        let suggestions = json["suggestions"].as_array().expect("suggestions array");
+        assert!(suggestions.is_empty());
+    }
+
+    // ── Governance API tests ──
+
+    #[cfg(feature = "governance")]
+    #[tokio::test]
+    async fn propose_and_list() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app,
+            "/field/propose",
+            serde_json::json!({
+                "proposer": "gov-test-1",
+                "parameter": "r_target",
+                "value": 0.85,
+                "reason": "testing governance"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(json.get("proposal_id").is_some());
+
+        // List proposals
+        let app2 = build_router(ctx);
+        let (status2, json2) = get_json(app2, "/field/proposals").await;
+        assert_eq!(status2, StatusCode::OK);
+        let proposals = json2["proposals"].as_array().expect("proposals");
+        assert_eq!(proposals.len(), 1);
+    }
+
+    #[cfg(feature = "governance")]
+    #[tokio::test]
+    async fn propose_invalid_parameter_rejected() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, _) = post_json(
+            app,
+            "/field/propose",
+            serde_json::json!({
+                "proposer": "gov-test",
+                "parameter": "invalid_param",
+                "value": 1.0,
+                "reason": "bad param"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(feature = "governance")]
+    #[tokio::test]
+    async fn vote_on_proposal() {
+        let ctx = test_ctx();
+        // Submit proposal
+        let app = build_router(ctx.clone());
+        let (_, json) = post_json(
+            app,
+            "/field/propose",
+            serde_json::json!({
+                "proposer": "vote-test-1",
+                "parameter": "r_target",
+                "value": 0.85,
+                "reason": "vote test"
+            }),
+        )
+        .await;
+        let proposal_id = json["proposal_id"].as_str().expect("proposal_id").to_owned();
+
+        // Vote
+        let app2 = build_router(ctx);
+        let (status, json2) = post_json(
+            app2,
+            &format!("/sphere/vote-test-2/vote/{proposal_id}"),
+            serde_json::json!({ "choice": "approve" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json2["choice"], "approve");
+    }
+
+    #[cfg(feature = "governance")]
+    #[tokio::test]
+    async fn sphere_consent_handler_returns_opt_outs() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/consent-test/register",
+            serde_json::json!({ "persona": "consent-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx);
+        let (status, json) = get_json(app2, "/sphere/consent-test/consent").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["opt_out_hebbian"], false);
+        assert_eq!(json["opt_out_external_modulation"], false);
+    }
+
+    #[cfg(feature = "governance")]
+    #[tokio::test]
+    async fn data_manifest_handler_returns_counts() {
+        let ctx = test_ctx();
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/manifest-test/register",
+            serde_json::json!({ "persona": "manifest-tester", "frequency": 0.1 }),
+        )
+        .await;
+
+        let app2 = build_router(ctx);
+        let (status, json) = get_json(app2, "/sphere/manifest-test/data-manifest").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["memories_count"], 0);
+        assert_eq!(json["buoys_count"], 3); // 3 buoys per sphere at creation
+    }
+
+    #[cfg(feature = "governance")]
+    #[tokio::test]
+    async fn proposals_empty_initially() {
+        let ctx = test_ctx();
+        let app = build_router(ctx);
+        let (status, json) = get_json(app, "/field/proposals").await;
+        assert_eq!(status, StatusCode::OK);
+        let proposals = json["proposals"].as_array().expect("proposals");
+        assert!(proposals.is_empty());
+    }
+
+    // ── E2E Integration tests ──
+
+    #[cfg(feature = "governance")]
+    #[tokio::test]
+    async fn e2e_governance_proposal_lifecycle() {
+        let ctx = test_ctx();
+
+        // Register 3 spheres
+        for name in &["gov-a", "gov-b", "gov-c"] {
+            let app = build_router(ctx.clone());
+            post_json(
+                app,
+                &format!("/sphere/{name}/register"),
+                serde_json::json!({ "persona": "governor", "frequency": 0.1 }),
+            )
+            .await;
+        }
+
+        // Submit proposal
+        let app = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app,
+            "/field/propose",
+            serde_json::json!({
+                "proposer": "gov-a",
+                "parameter": "r_target",
+                "value": 0.80,
+                "reason": "E2E governance test"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let proposal_id = json["proposal_id"].as_str().expect("id").to_owned();
+
+        // Two spheres vote approve
+        for voter in &["gov-b", "gov-c"] {
+            let app = build_router(ctx.clone());
+            let (status, _) = post_json(
+                app,
+                &format!("/sphere/{voter}/vote/{proposal_id}"),
+                serde_json::json!({ "choice": "approve" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        // Verify proposal has votes
+        let app = build_router(ctx.clone());
+        let (_, json) = get_json(app, "/field/proposals").await;
+        let proposals = json["proposals"].as_array().expect("proposals");
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0]["votes"], 2);
+    }
+
+    #[tokio::test]
+    async fn e2e_ghost_reincarnation_full_cycle() {
+        let ctx = test_ctx();
+
+        // 1. Register sphere
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/e2e-ghost/register",
+            serde_json::json!({ "persona": "ephemeral", "frequency": 0.1 }),
+        )
+        .await;
+
+        // 2. Set phase and record memories
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/e2e-ghost/phase",
+            serde_json::json!({ "phase": 2.0 }),
+        )
+        .await;
+
+        for _ in 0..3 {
+            let app = build_router(ctx.clone());
+            post_json(
+                app,
+                "/sphere/e2e-ghost/memory",
+                serde_json::json!({ "tool_name": "Read", "summary": "file" }),
+            )
+            .await;
+        }
+
+        // 3. Deregister — creates enriched ghost
+        let app = build_router(ctx.clone());
+        let (status, _) = post_json(
+            app,
+            "/sphere/e2e-ghost/deregister",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 4. Verify ghost exists with enriched data
+        let app = build_router(ctx.clone());
+        let (_, json) = get_json(app, "/ghosts").await;
+        let ghosts = json["ghosts"].as_array().expect("ghosts");
+        let ghost = ghosts.iter().find(|g| g["id"] == "e2e-ghost");
+        assert!(ghost.is_some(), "ghost should exist");
+        let ghost = ghost.expect("ghost");
+        assert_eq!(ghost["memory_count"], 3);
+        let top_tools = ghost["top_tools"].as_array().expect("top_tools");
+        assert!(!top_tools.is_empty());
+
+        // 5. Re-register — ghost phase restored
+        let app = build_router(ctx.clone());
+        let (status, json) = post_json(
+            app,
+            "/sphere/e2e-ghost/register",
+            serde_json::json!({ "persona": "reborn", "frequency": 0.1 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json["ghost_restored"], true);
+
+        // 6. Verify ghost consumed
+        let app = build_router(ctx.clone());
+        let (_, json) = get_json(app, "/ghosts").await;
+        let ghosts = json["ghosts"].as_array().expect("ghosts");
+        assert!(
+            !ghosts.iter().any(|g| g["id"] == "e2e-ghost"),
+            "ghost should be consumed"
+        );
+
+        // 7. Verify sphere exists
+        let app = build_router(ctx);
+        let (status, _) = get_json(app, "/sphere/e2e-ghost").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn e2e_consent_gate_integration() {
+        let ctx = test_ctx();
+
+        // Register sphere
+        let app = build_router(ctx.clone());
+        post_json(
+            app,
+            "/sphere/consent-e2e/register",
+            serde_json::json!({ "persona": "consenter", "frequency": 0.1 }),
+        )
+        .await;
+
+        // Check consent posture via consent endpoint
+        #[cfg(feature = "governance")]
+        {
+            let app = build_router(ctx.clone());
+            let (status, json) = get_json(app, "/sphere/consent-e2e/consent").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json["opt_out_hebbian"], false);
+            assert_eq!(json["opt_out_external_modulation"], false);
+        }
+
+        // Check data manifest
+        #[cfg(feature = "governance")]
+        {
+            let app = build_router(ctx.clone());
+            let (status, json) = get_json(app, "/sphere/consent-e2e/data-manifest").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json["memories_count"], 0);
+        }
+
+        // Steer and verify sphere still responds
+        let app = build_router(ctx.clone());
+        let (status, _) = post_json(
+            app,
+            "/sphere/consent-e2e/steer",
+            serde_json::json!({ "target_phase": 1.0, "strength": 0.5 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

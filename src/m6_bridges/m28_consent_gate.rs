@@ -65,6 +65,12 @@ pub struct BridgeContributions {
     pub nexus: f64,
     /// Maintenance Engine contribution.
     pub me: f64,
+    /// POVM bridge contribution (GAP-3).
+    pub povm: f64,
+    /// Reasoning Memory bridge contribution (GAP-3).
+    pub rm: f64,
+    /// Vortex Memory System bridge contribution (GAP-3).
+    pub vms: f64,
     /// Combined raw effect before consent gating.
     pub raw_combined: f64,
     /// Combined effect after consent gating.
@@ -130,7 +136,7 @@ impl SphereConsent {
 // ──────────────────────────────────────────────────────────────
 
 /// Mutable state behind a `RwLock`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct GateState {
     /// Last computed contributions.
     last_contributions: BridgeContributions,
@@ -140,6 +146,23 @@ struct GateState {
     gate_count: u64,
     /// Total rejections (opted-out or budget-exceeded).
     rejection_count: u64,
+    /// Runtime-mutable budget max (GAP-2). Governance proposals can change this.
+    budget_max: f64,
+    /// Runtime-mutable budget min.
+    budget_min: f64,
+}
+
+impl Default for GateState {
+    fn default() -> Self {
+        Self {
+            last_contributions: BridgeContributions::default(),
+            sphere_overrides: HashMap::new(),
+            gate_count: 0,
+            rejection_count: 0,
+            budget_max: m04_constants::K_MOD_BUDGET_MAX,
+            budget_min: m04_constants::K_MOD_BUDGET_MIN,
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -200,10 +223,17 @@ impl ConsentGate {
         state.gate_count = state.gate_count.saturating_add(1);
 
         // Step 1: Filter consenting spheres
-        let consenting: Vec<&SphereConsent> =
-            consents.iter().filter(|c| !c.opted_out).collect();
+        // Exclude opted-out AND divergence-requesting spheres (GAP-4 fix)
+        let consenting: Vec<&SphereConsent> = consents
+            .iter()
+            .filter(|c| !c.opted_out && !c.divergence_requested)
+            .collect();
 
-        let opted_out_count = consents.len() - consenting.len();
+        let opted_out_count = consents.iter().filter(|c| c.opted_out).count();
+        let divergence_exempt_count = consents
+            .iter()
+            .filter(|c| !c.opted_out && c.divergence_requested)
+            .count();
 
         if consenting.len() < MIN_CONSENTING {
             state.rejection_count = state.rejection_count.saturating_add(1);
@@ -244,18 +274,15 @@ impl ConsentGate {
             scaled
         };
 
-        // Step 5: Clamp to budget
-        let clamped = dampened.clamp(
-            m04_constants::K_MOD_BUDGET_MIN,
-            m04_constants::K_MOD_BUDGET_MAX,
-        );
+        // Step 5: Clamp to runtime budget (GAP-2: governance-mutable)
+        let clamped = dampened.clamp(state.budget_min, state.budget_max);
 
         // Update tracking
         state.last_contributions.gated_combined = clamped;
         state.last_contributions.raw_combined = raw_adj;
         state.last_contributions.mean_receptivity = mean_receptivity;
         state.last_contributions.consenting_count = consenting.len();
-        state.last_contributions.opted_out_count = opted_out_count;
+        state.last_contributions.opted_out_count = opted_out_count + divergence_exempt_count;
         state.last_contributions.tick = tick;
 
         Ok(clamped)
@@ -297,6 +324,47 @@ impl ConsentGate {
         self.apply(combined, consents, tick)
     }
 
+    /// Apply consent gate with all 6 bridge contributions (GAP-3 fix).
+    ///
+    /// Combines SYNTHEX, Nexus, ME, POVM, RM, and VMS adjustments.
+    /// All bridges now route through consent — no bypass.
+    ///
+    /// # Errors
+    /// Returns error if the combined effect is non-finite.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_combined_all(
+        &self,
+        synthex_adj: f64,
+        nexus_adj: f64,
+        me_adj: f64,
+        povm_adj: f64,
+        rm_adj: f64,
+        vms_adj: f64,
+        consents: &[SphereConsent],
+        tick: u64,
+    ) -> PvResult<f64> {
+        let combined = synthex_adj * nexus_adj * me_adj * povm_adj * rm_adj * vms_adj;
+
+        if !combined.is_finite() {
+            return Err(PvError::BridgeParse {
+                service: "consent_gate".to_owned(),
+                reason: "non-finite combined adjustment (6 bridges)".to_owned(),
+            });
+        }
+
+        {
+            let mut state = self.state.write();
+            state.last_contributions.synthex = synthex_adj;
+            state.last_contributions.nexus = nexus_adj;
+            state.last_contributions.me = me_adj;
+            state.last_contributions.povm = povm_adj;
+            state.last_contributions.rm = rm_adj;
+            state.last_contributions.vms = vms_adj;
+        }
+
+        self.apply(combined, consents, tick)
+    }
+
     /// Get the last computed contributions.
     #[must_use]
     pub fn last_contributions(&self) -> BridgeContributions {
@@ -313,6 +381,20 @@ impl ConsentGate {
     #[must_use]
     pub fn rejection_count(&self) -> u64 {
         self.state.read().rejection_count
+    }
+
+    /// Set the runtime budget maximum (GAP-2: governance proposals can widen/narrow).
+    ///
+    /// Clamped to `[1.0, 1.5]` to prevent abuse.
+    pub fn set_budget_max(&self, max: f64) {
+        let clamped = max.clamp(1.0, 1.5);
+        self.state.write().budget_max = clamped;
+    }
+
+    /// Get the current runtime budget maximum.
+    #[must_use]
+    pub fn budget_max(&self) -> f64 {
+        self.state.read().budget_max
     }
 
     /// Set a per-sphere `k_adj` override (for future V3.3 per-sphere isolation).
@@ -878,6 +960,9 @@ mod tests {
             synthex: 1.05,
             nexus: 0.98,
             me: 1.0,
+            povm: 1.0,
+            rm: 1.0,
+            vms: 1.0,
             raw_combined: 1.029,
             gated_combined: 1.02,
             mean_receptivity: 0.9,
@@ -947,5 +1032,97 @@ mod tests {
         let gate = ConsentGate::new();
         let consents = make_full_fleet(3);
         assert!(gate.apply(f64::NEG_INFINITY, &consents, 1).is_err());
+    }
+
+    // ── GAP-4: Divergence exemption ──
+
+    #[test]
+    fn divergence_requested_excludes_from_consent() {
+        let gate = ConsentGate::new();
+        let mut consents = make_full_fleet(4);
+        // 2 of 4 request divergence — they should be exempt
+        consents[0] = consents[0].clone().with_divergence(true);
+        consents[1] = consents[1].clone().with_divergence(true);
+        // Only 2 consenting spheres remain, both with receptivity 1.0
+        let adj = gate.apply(1.1, &consents, 1).unwrap();
+        assert!((adj - 1.1).abs() < 1e-10, "full receptivity from consenting only");
+    }
+
+    #[test]
+    fn all_divergence_requested_returns_neutral() {
+        let gate = ConsentGate::new();
+        let consents: Vec<SphereConsent> = (0..3)
+            .map(|i| {
+                make_consent(&format!("s{i}"), 1.0, 100).with_divergence(true)
+            })
+            .collect();
+        let adj = gate.apply(1.1, &consents, 1).unwrap();
+        assert!((adj - 1.0).abs() < 1e-10, "all exempt → neutral");
+    }
+
+    #[test]
+    fn divergence_mixed_with_opted_out() {
+        let gate = ConsentGate::new();
+        let mut consents = make_full_fleet(5);
+        consents[0] = consents[0].clone().with_opt_out(true);
+        consents[1] = consents[1].clone().with_divergence(true);
+        // 3 consenting, 1 opted out, 1 divergence exempt
+        let adj = gate.apply(1.1, &consents, 1).unwrap();
+        let contribs = gate.last_contributions();
+        assert_eq!(contribs.consenting_count, 3);
+        assert_eq!(contribs.opted_out_count, 2); // 1 opt-out + 1 divergence
+        assert!((adj - 1.1).abs() < 1e-10);
+    }
+
+    // ── GAP-3: 6-bridge consent gating ──
+
+    #[test]
+    fn apply_combined_all_6_bridges() {
+        let gate = ConsentGate::new();
+        let consents = make_full_fleet(4);
+        // All bridges at neutral except synthex (1.05) and vms (0.97)
+        let adj = gate
+            .apply_combined_all(1.05, 1.0, 1.0, 1.0, 1.0, 0.97, &consents, 1)
+            .unwrap();
+        // Combined = 1.05 * 0.97 = 1.0185, gated at full receptivity
+        assert!((adj - 1.0185).abs() < 0.001);
+        let contribs = gate.last_contributions();
+        assert!((contribs.povm - 1.0).abs() < 1e-10);
+        assert!((contribs.vms - 0.97).abs() < 1e-10);
+    }
+
+    #[test]
+    fn apply_combined_all_tracks_all_bridges() {
+        let gate = ConsentGate::new();
+        let consents = make_full_fleet(3);
+        let _ = gate
+            .apply_combined_all(1.02, 0.98, 1.01, 1.03, 0.99, 1.00, &consents, 5)
+            .unwrap();
+        let c = gate.last_contributions();
+        assert!((c.synthex - 1.02).abs() < 1e-10);
+        assert!((c.nexus - 0.98).abs() < 1e-10);
+        assert!((c.me - 1.01).abs() < 1e-10);
+        assert!((c.povm - 1.03).abs() < 1e-10);
+        assert!((c.rm - 0.99).abs() < 1e-10);
+        assert!((c.vms - 1.00).abs() < 1e-10);
+        assert_eq!(c.tick, 5);
+    }
+
+    // ── GAP-2: Runtime budget ──
+
+    #[test]
+    fn set_budget_max_widens_range() {
+        let gate = ConsentGate::new();
+        gate.set_budget_max(1.3);
+        assert!((gate.budget_max() - 1.3).abs() < 1e-10);
+    }
+
+    #[test]
+    fn set_budget_max_clamped_to_safe_range() {
+        let gate = ConsentGate::new();
+        gate.set_budget_max(2.0);
+        assert!((gate.budget_max() - 1.5).abs() < 1e-10);
+        gate.set_budget_max(0.5);
+        assert!((gate.budget_max() - 1.0).abs() < 1e-10);
     }
 }

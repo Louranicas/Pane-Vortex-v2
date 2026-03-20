@@ -78,23 +78,29 @@ impl Conductor {
 
     /// Compute the dynamic r target based on fleet state.
     ///
-    /// - Base: 0.93 for small/medium fleets.
-    /// - Large fleets (>50 spheres): 0.85.
-    /// - Fleet-negotiated: mean of spheres' `preferred_r` values (if any).
+    /// Priority (highest to lowest):
+    /// 1. Governance override (`r_target_override` from approved proposals)
+    /// 2. Fleet-negotiated: mean of spheres' `preferred_r` values
+    /// 3. Base: 0.93 (small/medium) or 0.85 (large >50 spheres)
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn r_target(state: &AppState) -> f64 {
+        // 1. Governance override takes priority
+        if let Some(override_val) = state.r_target_override {
+            return override_val.clamp(0.5, 0.99);
+        }
+
         let n = state.spheres.len();
         let n_f = n as f64;
 
-        // Base target depends on fleet size
+        // 2. Base target depends on fleet size
         let base = if n_f > m04_constants::LARGE_FLEET_THRESHOLD {
             m04_constants::R_TARGET_LARGE_FLEET
         } else {
             m04_constants::R_TARGET_BASE
         };
 
-        // Fleet-negotiated: average preferred_r from spheres that express a preference
+        // 3. Fleet-negotiated: average preferred_r from spheres that express a preference
         let preferred: Vec<f64> = state
             .spheres
             .values()
@@ -114,6 +120,11 @@ impl Conductor {
     ///
     /// This is the main control loop entry point called once per tick.
     pub fn conduct_breathing(&self, state: &mut AppState, decision: &FieldDecision) {
+        // Exponential decay on divergence_ema to prevent compounding/stickiness
+        // at budget clamp boundary. α=0.95 gives ~37-tick half-life.
+        state.divergence_ema *= 0.95;
+        state.coherence_ema *= 0.95;
+
         // Decrement cooldown
         state.divergence_cooldown = state.divergence_cooldown.saturating_sub(1);
 
@@ -761,5 +772,49 @@ mod tests {
         // Breathing should be suppressed during cooldown
         conductor.conduct_breathing(&mut state, &decision);
         assert_eq!(state.divergence_cooldown, DIVERGENCE_COOLDOWN_TICKS - 1);
+    }
+
+    #[test]
+    fn divergence_ema_decays_over_time() {
+        let conductor = Conductor::new();
+        let mut state = make_state_with_spheres(3);
+        state.divergence_ema = 0.1;
+        state.coherence_ema = 0.1;
+        let decision = make_decision(FieldAction::Stable);
+
+        // Run 50 ticks — EMA should decay toward 0
+        for _ in 0..50 {
+            conductor.conduct_breathing(&mut state, &decision);
+        }
+        assert!(
+            state.divergence_ema.abs() < 0.01,
+            "EMA should decay: {}",
+            state.divergence_ema
+        );
+        assert!(
+            state.coherence_ema.abs() < 0.01,
+            "coherence EMA should decay: {}",
+            state.coherence_ema
+        );
+    }
+
+    #[test]
+    fn divergence_ema_decay_prevents_stickiness() {
+        let conductor = Conductor::new();
+        let mut state = make_state_with_spheres(5);
+
+        // Saturate the EMA at max
+        state.divergence_ema = m04_constants::K_MOD_BUDGET_MAX - 1.0;
+
+        // Run stable ticks — should decay back
+        let decision = make_decision(FieldAction::Stable);
+        for _ in 0..100 {
+            conductor.conduct_breathing(&mut state, &decision);
+        }
+        assert!(
+            state.divergence_ema < 0.01,
+            "saturated EMA should recover: {}",
+            state.divergence_ema
+        );
     }
 }

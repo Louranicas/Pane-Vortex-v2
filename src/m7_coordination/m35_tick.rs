@@ -118,9 +118,13 @@ pub fn tick_orchestrator(
     let (field_state, decision) = tick_field_state(state, network, current_tick);
     timings.field_state_ms = p3_start.elapsed().as_secs_f64() * 1000.0;
 
+    // ── Phase 3.5: Governance actuator (GAP-1 fix) ──
+    #[cfg(feature = "governance")]
+    tick_governance(state, current_tick);
+
     // ── Phase 4: Conductor breathing ──
     let p4_start = Instant::now();
-    tick_conductor(state, conductor, &decision);
+    tick_conductor(state, conductor, &decision, network);
     timings.conductor_ms = p4_start.elapsed().as_secs_f64() * 1000.0;
 
     // ── Phase 5: Persistence check ──
@@ -246,16 +250,95 @@ fn tick_field_state(
 }
 
 // ──────────────────────────────────────────────────────────────
+// Phase 3.5: Governance actuator (GAP-1 fix)
+// ──────────────────────────────────────────────────────────────
+
+/// Apply approved governance proposals to field parameters.
+///
+/// Inserted between Phase 3 (field state) and Phase 4 (conductor) so that
+/// governance changes take effect before the conductor acts on `r_target`.
+///
+/// See `[[GAP-1 Fix — Governance Actuator]]` for design rationale.
+#[cfg(feature = "governance")]
+fn tick_governance(state: &mut AppState, tick: u64) {
+    use crate::m8_governance::m37_proposals::ProposableParameter;
+
+    // Process proposals: close expired, resolve voted
+    let sphere_count = state.spheres.len();
+    state.proposal_manager.process(tick, sphere_count);
+
+    // Apply approved proposals
+    let approved: Vec<(String, ProposableParameter, f64)> = state
+        .proposal_manager
+        .approved_unapplied()
+        .iter()
+        .map(|p| (p.id.clone(), p.parameter.clone(), p.proposed_value))
+        .collect();
+
+    for (id, parameter, value) in approved {
+        match parameter {
+            ProposableParameter::RTarget => {
+                state.r_target_override = Some(value);
+                state.log(format!(
+                    "governance: r_target set to {value:.3} (proposal {id})"
+                ));
+            }
+            ProposableParameter::KModBudgetMax => {
+                state.k_mod_budget_max_override = Some(value);
+                state.log(format!(
+                    "governance: k_mod_budget_max set to {value:.3} (proposal {id})"
+                ));
+            }
+            ProposableParameter::CouplingSteps => {
+                state.log(format!(
+                    "governance: coupling_steps proposed to {value:.0} (proposal {id})"
+                ));
+            }
+            ProposableParameter::SphereOverride { ref target_sphere } => {
+                // Store override intent — applied via ConsentGate externally
+                state.log(format!(
+                    "governance: sphere override {value:.3} for {target_sphere} (proposal {id})"
+                ));
+            }
+            ProposableParameter::OptOutPolicy => {
+                state.log(format!(
+                    "governance: opt-out policy set to {value:.1} (proposal {id})"
+                ));
+            }
+        }
+        state.proposal_manager.mark_applied(&id);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
 // Phase 4: Conductor breathing
 // ──────────────────────────────────────────────────────────────
 
 /// Apply conductor breathing based on the field decision.
+///
+/// After the conductor computes its adjustment (stored in `state.divergence_ema`),
+/// compose it multiplicatively with the existing bridge-derived `k_modulation` to
+/// prevent last-writer-wins. Both conductor and bridge contributions are preserved.
 fn tick_conductor(
     state: &mut AppState,
     conductor: &Conductor,
     decision: &FieldDecision,
+    network: &mut CouplingNetwork,
 ) {
     conductor.conduct_breathing(state, decision);
+
+    // Compose conductor adjustment with bridge k_modulation
+    // Conductor stores additive offset in divergence_ema ∈ [-0.15, 0.15]
+    // Bridge k_modulation set asynchronously via consent gate
+    // Multiplicative composition: final = bridge * (1 + conductor)
+    let conductor_factor = 1.0 + state.divergence_ema;
+    let budget_max = state
+        .k_mod_budget_max_override
+        .unwrap_or(m04_constants::K_MOD_BUDGET_MAX);
+    network.k_modulation = (network.k_modulation * conductor_factor).clamp(
+        m04_constants::K_MOD_BUDGET_MIN,
+        budget_max,
+    );
 
     // Inject phase noise if divergence is needed
     if matches!(
@@ -535,12 +618,112 @@ mod tests {
 
     // ── Phase 4: Conductor ──
 
+    #[cfg(feature = "governance")]
+    #[test]
+    fn governance_actuator_applies_proposal() {
+        use crate::m8_governance::m37_proposals::{ProposableParameter, VoteChoice};
+
+        let (mut state, mut network) = make_state_with_spheres(3);
+        let conductor = Conductor::new();
+
+        // Submit and approve a proposal to change r_target
+        let proposal_id = state
+            .proposal_manager
+            .submit(
+                pid("s0"),
+                ProposableParameter::RTarget,
+                0.80,
+                0.93,
+                "lower target for testing".into(),
+                0,
+            )
+            .unwrap();
+        state
+            .proposal_manager
+            .vote(&proposal_id, pid("s1"), VoteChoice::Approve, 1)
+            .unwrap();
+        state
+            .proposal_manager
+            .vote(&proposal_id, pid("s2"), VoteChoice::Approve, 2)
+            .unwrap();
+        // Process to close and approve (window=24, need to advance past it)
+        state.proposal_manager.process(30, 3);
+
+        // Verify proposal is approved but not yet applied
+        assert_eq!(state.proposal_manager.approved_unapplied().len(), 1);
+
+        // Run tick — governance actuator should apply the proposal
+        tick_orchestrator(&mut state, &mut network, &conductor);
+
+        // r_target_override should be set
+        assert!(state.r_target_override.is_some());
+        assert!((state.r_target_override.unwrap() - 0.80).abs() < 0.01);
+
+        // Proposal should be marked as applied
+        assert_eq!(state.proposal_manager.approved_unapplied().len(), 0);
+    }
+
+    #[cfg(feature = "governance")]
+    #[test]
+    fn governance_r_target_override_affects_conductor() {
+        let (mut state, _) = make_state_with_spheres(3);
+        state.r_target_override = Some(0.75);
+        let target = Conductor::r_target(&state);
+        assert!((target - 0.75).abs() < 0.01);
+    }
+
     #[test]
     fn conductor_called_without_panic() {
-        let (mut state, _) = make_state_with_spheres(3);
+        let (mut state, mut network) = make_state_with_spheres(3);
         let conductor = Conductor::new();
         let decision = FieldDecision::recovering(1);
-        tick_conductor(&mut state, &conductor, &decision);
+        tick_conductor(&mut state, &conductor, &decision, &mut network);
+    }
+
+    #[test]
+    fn conductor_composes_with_bridge_k_mod() {
+        let (mut state, mut network) = make_state_with_spheres(5);
+        let conductor = Conductor::new();
+
+        // Simulate bridge setting k_modulation to 1.1
+        network.k_modulation = 1.1;
+
+        // Simulate conductor having a positive divergence_ema
+        state.divergence_ema = 0.02;
+
+        let decision = FieldDecision::recovering(1);
+        tick_conductor(&mut state, &conductor, &decision, &mut network);
+
+        // k_modulation should be bridge * (1 + conductor) = 1.1 * 1.02 ≈ 1.122
+        // NOT simply overwritten by either contributor
+        assert!(
+            network.k_modulation > 1.1,
+            "k_mod should compose multiplicatively: {}",
+            network.k_modulation
+        );
+        assert!(
+            network.k_modulation <= m04_constants::K_MOD_BUDGET_MAX,
+            "k_mod should stay within budget"
+        );
+    }
+
+    #[test]
+    fn conductor_k_mod_clamped_to_budget() {
+        let (mut state, mut network) = make_state_with_spheres(3);
+        let conductor = Conductor::new();
+
+        // Both at maximum — should not exceed budget
+        network.k_modulation = m04_constants::K_MOD_BUDGET_MAX;
+        state.divergence_ema = 0.15;
+
+        let decision = FieldDecision::recovering(1);
+        tick_conductor(&mut state, &conductor, &decision, &mut network);
+
+        assert!(
+            network.k_modulation <= m04_constants::K_MOD_BUDGET_MAX,
+            "k_mod must not exceed budget: {}",
+            network.k_modulation
+        );
     }
 
     // ── Phase 5: Persistence ──

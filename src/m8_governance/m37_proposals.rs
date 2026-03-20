@@ -47,7 +47,7 @@ pub struct Proposal {
 }
 
 /// Parameters that can be proposed for change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposableParameter {
     /// Target order parameter.
     RTarget,
@@ -55,6 +55,13 @@ pub enum ProposableParameter {
     KModBudgetMax,
     /// Coupling steps per tick.
     CouplingSteps,
+    /// Per-sphere `k_mod` override (GAP-5). Value is the override, target sphere in `reason`.
+    SphereOverride {
+        /// Target sphere ID for the override.
+        target_sphere: String,
+    },
+    /// Fleet-wide opt-out policy (GAP-6). Value: 0.0=allow opt-out, 1.0=require participation.
+    OptOutPolicy,
 }
 
 /// Proposal lifecycle status.
@@ -100,7 +107,7 @@ pub enum VoteChoice {
 // ──────────────────────────────────────────────────────────────
 
 /// Manages the lifecycle of governance proposals.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProposalManager {
     /// Active and archived proposals.
     proposals: HashMap<String, Proposal>,
@@ -114,12 +121,15 @@ pub struct ProposalManager {
 
 impl ProposalManager {
     /// Create a new proposal manager with default config.
+    ///
+    /// Voting window is 24 ticks (120s at 5s/tick) to accommodate
+    /// Nexus bridge 60-tick poll interval (GAP-7 fix).
     #[must_use]
     pub fn new() -> Self {
         Self {
             proposals: HashMap::new(),
             max_active: m04_constants::DECISION_HISTORY_MAX, // 100
-            voting_window: 5,
+            voting_window: 24,
             quorum_threshold: 0.5,
         }
     }
@@ -159,7 +169,7 @@ impl ProposalManager {
         }
 
         // Validate proposed value
-        validate_proposed_value(parameter, proposed_value)?;
+        validate_proposed_value(&parameter, proposed_value)?;
 
         let id = TaskId::new().to_string();
         let proposal = Proposal {
@@ -284,7 +294,7 @@ impl ProposalManager {
 // ──────────────────────────────────────────────────────────────
 
 /// Validate a proposed parameter value.
-fn validate_proposed_value(parameter: ProposableParameter, value: f64) -> PvResult<()> {
+fn validate_proposed_value(parameter: &ProposableParameter, value: f64) -> PvResult<()> {
     if !value.is_finite() {
         return Err(PvError::NonFinite {
             field: "proposed_value",
@@ -320,6 +330,28 @@ fn validate_proposed_value(parameter: ProposableParameter, value: f64) -> PvResu
                     value,
                     min: 1.0,
                     max: 50.0,
+                });
+            }
+        }
+        ProposableParameter::SphereOverride { .. } => {
+            // Per-sphere k_mod override must be within budget range
+            if !(0.5..=1.5).contains(&value) {
+                return Err(PvError::OutOfRange {
+                    field: "sphere_override",
+                    value,
+                    min: 0.5,
+                    max: 1.5,
+                });
+            }
+        }
+        ProposableParameter::OptOutPolicy => {
+            // 0.0 = opt-out allowed, 1.0 = participation required
+            if !(0.0..=1.0).contains(&value) {
+                return Err(PvError::OutOfRange {
+                    field: "opt_out_policy",
+                    value,
+                    min: 0.0,
+                    max: 1.0,
                 });
             }
         }
@@ -569,27 +601,27 @@ mod tests {
 
     #[test]
     fn validate_r_target_valid() {
-        assert!(validate_proposed_value(ProposableParameter::RTarget, 0.85).is_ok());
+        assert!(validate_proposed_value(&ProposableParameter::RTarget, 0.85).is_ok());
     }
 
     #[test]
     fn validate_r_target_too_low() {
-        assert!(validate_proposed_value(ProposableParameter::RTarget, 0.1).is_err());
+        assert!(validate_proposed_value(&ProposableParameter::RTarget, 0.1).is_err());
     }
 
     #[test]
     fn validate_r_target_too_high() {
-        assert!(validate_proposed_value(ProposableParameter::RTarget, 1.5).is_err());
+        assert!(validate_proposed_value(&ProposableParameter::RTarget, 1.5).is_err());
     }
 
     #[test]
     fn validate_k_budget_valid() {
-        assert!(validate_proposed_value(ProposableParameter::KModBudgetMax, 1.2).is_ok());
+        assert!(validate_proposed_value(&ProposableParameter::KModBudgetMax, 1.2).is_ok());
     }
 
     #[test]
     fn validate_coupling_steps_valid() {
-        assert!(validate_proposed_value(ProposableParameter::CouplingSteps, 15.0).is_ok());
+        assert!(validate_proposed_value(&ProposableParameter::CouplingSteps, 15.0).is_ok());
     }
 
     // ── Evaluate ──

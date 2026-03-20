@@ -111,6 +111,17 @@ pub struct AppState {
     /// Current cascade depth.
     #[serde(skip)]
     pub cascade_depth: u32,
+    /// Governance: proposal manager (V3.4, feature-gated).
+    /// Uses `serde(default)` so snapshots without governance data still deserialize.
+    #[cfg(feature = "governance")]
+    #[serde(default)]
+    pub proposal_manager: crate::m8_governance::m37_proposals::ProposalManager,
+    /// Dynamic `r_target` override from governance proposals (GAP-2).
+    #[serde(default)]
+    pub r_target_override: Option<f64>,
+    /// Dynamic `k_mod_budget_max` override from governance proposals (GAP-2).
+    #[serde(default)]
+    pub k_mod_budget_max_override: Option<f64>,
 }
 
 impl AppState {
@@ -141,6 +152,10 @@ impl AppState {
             last_bridge_adjustments: BridgeAdjustments::default(),
             prev_bridge_staleness: BridgeStaleness::default(),
             cascade_depth: 0,
+            #[cfg(feature = "governance")]
+            proposal_manager: crate::m8_governance::m37_proposals::ProposalManager::new(),
+            r_target_override: None,
+            k_mod_budget_max_override: None,
         }
     }
 
@@ -187,6 +202,15 @@ impl AppState {
         while self.ghosts.len() > m04_constants::GHOST_MAX {
             self.ghosts.pop_front();
         }
+    }
+
+    /// Accept (consume) a ghost trace by exact ID match.
+    ///
+    /// Returns the ghost if found and consumed, `None` if no matching ghost exists.
+    /// This prevents multiple claimants (G4 gap fix).
+    pub fn accept_ghost(&mut self, id: &PaneId) -> Option<GhostTrace> {
+        let pos = self.ghosts.iter().position(|g| g.id == *id)?;
+        self.ghosts.remove(pos)
     }
 
     /// Whether the field is in warmup mode.
@@ -431,6 +455,56 @@ mod tests {
             strongest_neighbors: vec![],
         });
         assert_eq!(s.ghosts.len(), 1);
+    }
+
+    #[test]
+    fn accept_ghost_consumes() {
+        let mut s = AppState::new();
+        s.add_ghost(GhostTrace {
+            id: pid("reborn"),
+            persona: "returner".into(),
+            deregistered_at: 50,
+            total_steps_lived: 25,
+            memory_count: 5,
+            top_tools: vec![],
+            phase_at_departure: 2.0,
+            receptivity: 0.9,
+            work_signature: WorkSignature::default(),
+            strongest_neighbors: vec![],
+        });
+        let ghost = s.accept_ghost(&pid("reborn"));
+        assert!(ghost.is_some());
+        assert_eq!(ghost.expect("ghost").id, pid("reborn"));
+        // Ghost should be consumed — not findable again
+        assert!(s.accept_ghost(&pid("reborn")).is_none());
+        assert!(s.ghosts.is_empty());
+    }
+
+    #[test]
+    fn accept_ghost_missing_returns_none() {
+        let mut s = AppState::new();
+        assert!(s.accept_ghost(&pid("nonexistent")).is_none());
+    }
+
+    #[test]
+    fn accept_ghost_exact_id_match() {
+        let mut s = AppState::new();
+        s.add_ghost(GhostTrace {
+            id: pid("specific-id"),
+            persona: "test".into(),
+            deregistered_at: 10,
+            total_steps_lived: 5,
+            memory_count: 0,
+            top_tools: vec![],
+            phase_at_departure: 1.0,
+            receptivity: 1.0,
+            work_signature: WorkSignature::default(),
+            strongest_neighbors: vec![],
+        });
+        // Different ID should not match
+        assert!(s.accept_ghost(&pid("different-id")).is_none());
+        // Exact ID should match
+        assert!(s.accept_ghost(&pid("specific-id")).is_some());
     }
 
     #[test]
