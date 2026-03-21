@@ -101,6 +101,8 @@ pub struct BusTask {
     pub claimed_by: Option<PaneId>,
     /// Unix timestamp when the task was submitted.
     pub submitted_at: f64,
+    /// Unix timestamp when the task was claimed (if any).
+    pub claimed_at: Option<f64>,
     /// Unix timestamp when the task was completed (if any).
     pub completed_at: Option<f64>,
 }
@@ -117,6 +119,7 @@ impl BusTask {
             submitted_by,
             claimed_by: None,
             submitted_at: now_secs(),
+            claimed_at: None,
             completed_at: None,
         }
     }
@@ -140,6 +143,18 @@ impl BusTask {
         }
         self.status = TaskStatus::Claimed;
         self.claimed_by = Some(claimer);
+        self.claimed_at = Some(now_secs());
+        true
+    }
+
+    /// Requeue a claimed task back to pending (for stale claim recovery).
+    pub fn requeue(&mut self) -> bool {
+        if self.status != TaskStatus::Claimed {
+            return false;
+        }
+        self.status = TaskStatus::Pending;
+        self.claimed_by = None;
+        self.claimed_at = None;
         true
     }
 

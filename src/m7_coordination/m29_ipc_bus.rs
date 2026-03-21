@@ -296,6 +296,14 @@ impl BusState {
         self.tasks.get(task_id)
     }
 
+    /// Get a mutable reference to a task by ID (for claim/complete/fail).
+    pub fn get_task_mut(&mut self, task_id: &str) -> Option<&mut BusTask> {
+        self.tasks
+            .iter_mut()
+            .find(|(k, _)| k.as_str() == task_id)
+            .map(|(_, v)| v)
+    }
+
     /// Get pending tasks targeted at a specific sphere.
     #[must_use]
     pub fn tasks_for_sphere(&self, pane_id: &PaneId) -> Vec<&BusTask> {
@@ -329,6 +337,25 @@ impl BusState {
             }
             true
         });
+    }
+
+    /// Requeue claimed tasks that have been stale longer than `timeout_secs`.
+    ///
+    /// Returns the number of tasks requeued.
+    pub fn prune_stale_claims(&mut self, timeout_secs: f64) -> usize {
+        let now = now_secs();
+        let mut requeued = 0;
+        for task in self.tasks.values_mut() {
+            if task.status == TaskStatus::Claimed {
+                if let Some(claimed_at) = task.claimed_at {
+                    if now - claimed_at > timeout_secs {
+                        task.requeue();
+                        requeued += 1;
+                    }
+                }
+            }
+        }
+        requeued
     }
 
     // ── Suggestion management ──

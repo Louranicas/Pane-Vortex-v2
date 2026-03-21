@@ -295,6 +295,17 @@ fn spawn_tick_loop(
                 bus_state.write().publish_event(event);
             }
 
+            // ── Prune stale tasks (GAP-G1 + GAP-G2) ──
+            {
+                let mut bus = bus_state.write();
+                bus.prune_completed_tasks(3600.0);
+                let requeued = bus.prune_stale_claims(300.0);
+                drop(bus);
+                if requeued > 0 {
+                    eprintln!("[tick] requeued {requeued} stale claimed tasks");
+                }
+            }
+
             // ── Generate suggestions → BusState ──
             {
                 let spheres_snap = state.read().spheres.clone();

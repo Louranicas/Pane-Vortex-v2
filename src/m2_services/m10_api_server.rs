@@ -7,7 +7,7 @@
 //! ## Module: M10
 //! ## Dependencies: L1 (M02, M03, M06), L3 (M15 `SharedState`), L4 (M16, M18), L7 (M29, M30)
 //!
-//! ## Route Groups (33 total)
+//! ## Route Groups (36 total)
 //!
 //! | Group | Count | Description |
 //! |-------|-------|-------------|
@@ -16,7 +16,7 @@
 //! | Sphere CRUD | 6 | `/sphere/{pane_id}/*` — register, deregister, memory, status, heartbeat |
 //! | Sphere Advanced | 4 | `/sphere/{pane_id}/neighbors`, inbox, send, ack |
 //! | Coupling | 2 | `/coupling/matrix`, `/coupling/weight` |
-//! | Bus | 6 | `/bus/info`, `/bus/tasks`, `/bus/events`, `/bus/submit`, `/bus/cascade`, `/bus/cascades` |
+//! | Bus | 9 | `/bus/info`, tasks, events, submit, claim, complete, fail, cascade, cascades |
 //! | Bridges | 1 | `/bridges/health` |
 
 use std::net::SocketAddr;
@@ -1115,6 +1115,7 @@ async fn bus_submit_handler(
     Json(body): Json<TaskSubmitRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let submitter = PaneId::new(body.submitter);
+    validate_pane_id(submitter.as_str())?;
     let target = match body.target.to_lowercase().as_str() {
         "any_idle" | "anyidle" => TaskTarget::AnyIdle,
         "field_driven" | "fielddriven" => TaskTarget::FieldDriven,
@@ -1149,6 +1150,124 @@ async fn bus_submit_handler(
             "status": "Pending",
         })),
     ))
+}
+
+/// POST `/bus/tasks/{task_id}/claim` -- Claim a pending task.
+async fn bus_task_claim_handler(
+    State(ctx): State<AppContext>,
+    Path(task_id): Path<String>,
+    Json(body): Json<TaskClaimRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_pane_id(&body.claimer)?;
+    let claim_sphere = PaneId::new(body.claimer.clone());
+
+    let ok = {
+        let mut bus = ctx.bus.write();
+        let task = bus.get_task_mut(&task_id).ok_or_else(|| {
+            PvError::SphereNotFound(format!("task not found: {task_id}"))
+        })?;
+        task.claim(claim_sphere)
+    };
+
+    if ok {
+        // Publish task.claimed event
+        {
+            let tick = ctx.state.read().tick;
+            let event = crate::m7_coordination::m30_bus_types::BusEvent::new(
+                "task.claimed".into(),
+                serde_json::json!({
+                    "task_id": task_id,
+                    "claimer": body.claimer,
+                }),
+                tick,
+            );
+            ctx.bus.write().publish_event(event);
+        }
+        Ok(Json(serde_json::json!({
+            "task_id": task_id,
+            "status": "Claimed",
+            "claimer": body.claimer,
+        })))
+    } else {
+        Err(ApiError(PvError::ConfigValidation(
+            format!("task {task_id} cannot be claimed (not pending)"),
+        )))
+    }
+}
+
+/// POST `/bus/tasks/{task_id}/complete` -- Mark a claimed task as completed.
+async fn bus_task_complete_handler(
+    State(ctx): State<AppContext>,
+    Path(task_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let completed = {
+        let mut bus = ctx.bus.write();
+        let task = bus.get_task_mut(&task_id).ok_or_else(|| {
+            PvError::SphereNotFound(format!("task not found: {task_id}"))
+        })?;
+        task.complete()
+    };
+
+    if completed {
+        {
+            let tick = ctx.state.read().tick;
+            let event = crate::m7_coordination::m30_bus_types::BusEvent::new(
+                "task.completed".into(),
+                serde_json::json!({ "task_id": task_id }),
+                tick,
+            );
+            ctx.bus.write().publish_event(event);
+        }
+        Ok(Json(serde_json::json!({
+            "task_id": task_id,
+            "status": "Completed",
+        })))
+    } else {
+        Err(ApiError(PvError::ConfigValidation(
+            format!("task {task_id} cannot be completed (not claimed)"),
+        )))
+    }
+}
+
+/// POST `/bus/tasks/{task_id}/fail` -- Mark a claimed task as failed.
+async fn bus_task_fail_handler(
+    State(ctx): State<AppContext>,
+    Path(task_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let failed = {
+        let mut bus = ctx.bus.write();
+        let task = bus.get_task_mut(&task_id).ok_or_else(|| {
+            PvError::SphereNotFound(format!("task not found: {task_id}"))
+        })?;
+        task.fail()
+    };
+
+    if failed {
+        {
+            let tick = ctx.state.read().tick;
+            let event = crate::m7_coordination::m30_bus_types::BusEvent::new(
+                "task.failed".into(),
+                serde_json::json!({ "task_id": task_id }),
+                tick,
+            );
+            ctx.bus.write().publish_event(event);
+        }
+        Ok(Json(serde_json::json!({
+            "task_id": task_id,
+            "status": "Failed",
+        })))
+    } else {
+        Err(ApiError(PvError::ConfigValidation(
+            format!("task {task_id} cannot be failed (not claimed)"),
+        )))
+    }
+}
+
+/// Request body for task claim.
+#[derive(Debug, Deserialize)]
+struct TaskClaimRequest {
+    /// ID of the sphere claiming the task.
+    claimer: String,
 }
 
 /// POST /bus/cascade -- Initiate a cascade handoff via HTTP.
@@ -1497,11 +1616,14 @@ pub fn build_router(ctx: AppContext) -> Router {
         // Coupling (2)
         .route("/coupling/matrix", get(coupling_matrix_handler))
         .route("/coupling/weight", post(coupling_weight_handler))
-        // Bus (6)
+        // Bus (9)
         .route("/bus/info", get(bus_info_handler))
         .route("/bus/tasks", get(bus_tasks_handler))
         .route("/bus/events", get(bus_events_handler))
         .route("/bus/submit", post(bus_submit_handler))
+        .route("/bus/claim/{task_id}", post(bus_task_claim_handler))
+        .route("/bus/complete/{task_id}", post(bus_task_complete_handler))
+        .route("/bus/fail/{task_id}", post(bus_task_fail_handler))
         .route("/bus/cascade", post(bus_cascade_handler))
         .route("/bus/cascades", get(bus_cascades_handler))
         // Bridges (1)

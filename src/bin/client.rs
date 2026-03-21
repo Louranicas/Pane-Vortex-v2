@@ -72,6 +72,9 @@ enum Cmd {
     Submit { description: String, target: String },
     Cascade { target: String, brief: String },
     Disconnect,
+    Poll,
+    Claim { task_id: String },
+    Complete { task_id: String },
 }
 
 fn parse_args() -> Option<Cmd> {
@@ -125,6 +128,23 @@ fn parse_args() -> Option<Cmd> {
             Some(Cmd::Cascade { target, brief })
         }
         "disconnect" => Some(Cmd::Disconnect),
+        "poll" => Some(Cmd::Poll),
+        "claim" => {
+            let task_id = args.get(1).cloned().unwrap_or_default();
+            if task_id.is_empty() {
+                eprintln!("claim requires a task_id argument");
+                return None;
+            }
+            Some(Cmd::Claim { task_id })
+        }
+        "complete" => {
+            let task_id = args.get(1).cloned().unwrap_or_default();
+            if task_id.is_empty() {
+                eprintln!("complete requires a task_id argument");
+                return None;
+            }
+            Some(Cmd::Complete { task_id })
+        }
         _ => {
             print_usage();
             None
@@ -141,6 +161,9 @@ fn print_usage() {
     eprintln!("  submit <desc> [--target T]    Submit a task");
     eprintln!("  cascade <target> [--brief B]  Dispatch cascade handoff");
     eprintln!("  disconnect                    Graceful disconnection");
+    eprintln!("  poll                          List pending tasks (HTTP)");
+    eprintln!("  claim <task_id>               Claim a pending task (HTTP)");
+    eprintln!("  complete <task_id>            Complete a claimed task (HTTP)");
     eprintln!();
     eprintln!("Environment:");
     eprintln!("  PANE_VORTEX_ID       Sphere ID (default: client:<pid>)");
@@ -362,7 +385,128 @@ async fn main() -> ExitCode {
         } => run_submit(&config, description, target).await,
         Cmd::Cascade { target, brief } => run_cascade(&config, target, brief).await,
         Cmd::Disconnect => run_disconnect(&config).await,
+        Cmd::Poll => run_http_poll().await,
+        Cmd::Claim { task_id } => run_http_claim(&config, task_id).await,
+        Cmd::Complete { task_id } => run_http_complete(task_id).await,
     };
 
     ExitCode::from(code)
+}
+
+// ── HTTP-based commands (raw TCP, no hyper) ──
+
+/// Poll for pending tasks via HTTP GET `/bus/tasks`.
+async fn run_http_poll() -> u8 {
+    let url = pv_url();
+    let Ok(resp) = http_get(&format!("{url}/bus/tasks")).await else {
+        return EXIT_CONNECTION;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp) else {
+        eprintln!("failed to parse response");
+        return EXIT_PROTOCOL;
+    };
+    let pending: Vec<&serde_json::Value> = parsed["tasks"]
+        .as_array()
+        .map_or_else(Vec::new, |arr| {
+            arr.iter()
+                .filter(|t| t["status"].as_str() == Some("Pending"))
+                .collect()
+        });
+    println!("{}", serde_json::json!(pending));
+    EXIT_OK
+}
+
+/// Claim a pending task via HTTP POST `/bus/tasks/{id}/claim`.
+async fn run_http_claim(config: &Config, task_id: String) -> u8 {
+    let url = pv_url();
+    let payload = serde_json::json!({"claimer": config.sphere_id});
+    let Ok(resp) = http_post(
+        &format!("{url}/bus/claim/{task_id}"),
+        &payload.to_string(),
+    )
+    .await
+    else {
+        return EXIT_CONNECTION;
+    };
+    println!("{resp}");
+    EXIT_OK
+}
+
+/// Complete a claimed task via HTTP POST `/bus/tasks/{id}/complete`.
+async fn run_http_complete(task_id: String) -> u8 {
+    let url = pv_url();
+    let Ok(resp) = http_post(&format!("{url}/bus/complete/{task_id}"), "{}").await else {
+        return EXIT_CONNECTION;
+    };
+    println!("{resp}");
+    EXIT_OK
+}
+
+/// Get PV daemon URL from env.
+fn pv_url() -> String {
+    std::env::var("PANE_VORTEX_URL").unwrap_or_else(|_| "http://localhost:8132".to_string())
+}
+
+/// Raw TCP HTTP GET (fire-and-forget, no hyper).
+async fn http_get(url: &str) -> Result<String, u8> {
+    let (host, path) = parse_url(url);
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    raw_http(&host, &request).await
+}
+
+/// Raw TCP HTTP POST with JSON body (fire-and-forget, no hyper).
+async fn http_post(url: &str, body: &str) -> Result<String, u8> {
+    let (host, path) = parse_url(url);
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    raw_http(&host, &request).await
+}
+
+/// Parse URL into (host:port, path).
+fn parse_url(url: &str) -> (String, String) {
+    let stripped = url.strip_prefix("http://").unwrap_or(url);
+    stripped
+        .split_once('/')
+        .map_or_else(
+            || (stripped.to_string(), "/".to_string()),
+            |(h, p)| (h.to_string(), format!("/{p}")),
+        )
+}
+
+/// Send raw HTTP request via TCP and return response body.
+async fn raw_http(host: &str, request: &str) -> Result<String, u8> {
+    use tokio::net::TcpStream;
+    let Ok(Ok(stream)) = tokio::time::timeout(
+        Duration::from_secs(2),
+        TcpStream::connect(host),
+    )
+    .await
+    else {
+        eprintln!("HTTP connection failed to {host}");
+        return Err(EXIT_CONNECTION);
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
+    writer
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|_| EXIT_PROTOCOL)?;
+    writer.flush().await.map_err(|_| EXIT_PROTOCOL)?;
+    let mut buf_reader = BufReader::new(reader);
+    let mut response = String::new();
+    loop {
+        let mut line = String::new();
+        match buf_reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => response.push_str(&line),
+        }
+    }
+    // Extract body after \r\n\r\n
+    Ok(response
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .to_string())
 }
