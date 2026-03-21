@@ -34,6 +34,7 @@ use crate::m3_field::{
     m15_app_state::AppState,
 };
 use crate::m4_coupling::m16_coupling_network::CouplingNetwork;
+use crate::m6_bridges::BridgeSet;
 use super::m31_conductor::Conductor;
 
 // ──────────────────────────────────────────────────────────────
@@ -74,6 +75,8 @@ pub struct PhaseTiming {
     pub conductor_ms: f64,
     /// Phase 5: persistence check (ms).
     pub persistence_ms: f64,
+    /// Phase 2.7: bridge `k_mod` application (ms).
+    pub bridge_ms: f64,
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -91,6 +94,7 @@ pub fn tick_orchestrator(
     state: &mut AppState,
     network: &mut CouplingNetwork,
     conductor: &Conductor,
+    bridges: Option<&BridgeSet>,
 ) -> TickResult {
     let tick_start = Instant::now();
     state.tick += 1;
@@ -116,10 +120,33 @@ pub fn tick_orchestrator(
     // ── Phase 2.5: Hebbian STDP learning (BUG-031 fix) ──
     tick_hebbian(state, network);
 
+    // ── Phase 2.7: Bridge k_mod application ──
+    let bridge_start = Instant::now();
+    if let Some(bridges) = bridges {
+        bridges.apply_k_mod(state, network);
+    }
+    timings.bridge_ms = bridge_start.elapsed().as_secs_f64() * 1000.0;
+
     // ── Phase 3: Field state computation ──
     let p3_start = Instant::now();
     let (field_state, decision) = tick_field_state(state, network, current_tick);
     timings.field_state_ms = p3_start.elapsed().as_secs_f64() * 1000.0;
+
+    // ── Phase 3.1: Harmonic damping (H3 — l2 quadrupole feedback) ──
+    // When l2 > 0.70, increase K to break 4-way phase clustering.
+    // Formula: k_adj = 1.0 + 0.15 * (1.0 - r) * (l2 - 0.70) / 0.30
+    {
+        let l2 = field_state.harmonics.l2_quadrupole;
+        let r = field_state.order_parameter.r;
+        if l2 > 0.70 {
+            let l2_adj = 1.0 + 0.15 * (1.0 - r) * (l2 - 0.70) / 0.30;
+            network.k_modulation *= l2_adj;
+            network.k_modulation = network.k_modulation.clamp(
+                crate::m1_foundation::m04_constants::K_MOD_BUDGET_MIN,
+                crate::m1_foundation::m04_constants::K_MOD_BUDGET_MAX,
+            );
+        }
+    }
 
     // ── Phase 3.5: Governance actuator (GAP-1 fix) ──
     #[cfg(feature = "governance")]
@@ -421,7 +448,7 @@ mod tests {
     fn tick_result_fields() {
         let (mut state, mut network) = make_state_with_spheres(3);
         let conductor = Conductor::new();
-        let result = tick_orchestrator(&mut state, &mut network, &conductor);
+        let result = tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert!(result.total_ms >= 0.0);
         assert_eq!(result.tick, 1);
         assert_eq!(result.sphere_count, 3);
@@ -446,7 +473,7 @@ mod tests {
         let mut state = AppState::new();
         let mut network = CouplingNetwork::new();
         let conductor = Conductor::new();
-        let result = tick_orchestrator(&mut state, &mut network, &conductor);
+        let result = tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert_eq!(result.tick, 1);
         assert_eq!(result.sphere_count, 0);
     }
@@ -456,9 +483,9 @@ mod tests {
         let mut state = AppState::new();
         let mut network = CouplingNetwork::new();
         let conductor = Conductor::new();
-        tick_orchestrator(&mut state, &mut network, &conductor);
+        tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert_eq!(state.tick, 1);
-        tick_orchestrator(&mut state, &mut network, &conductor);
+        tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert_eq!(state.tick, 2);
     }
 
@@ -466,7 +493,7 @@ mod tests {
     fn tick_single_sphere() {
         let (mut state, mut network) = make_state_with_spheres(1);
         let conductor = Conductor::new();
-        let result = tick_orchestrator(&mut state, &mut network, &conductor);
+        let result = tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert_eq!(result.sphere_count, 1);
     }
 
@@ -474,7 +501,7 @@ mod tests {
     fn tick_multiple_spheres() {
         let (mut state, mut network) = make_state_with_spheres(5);
         let conductor = Conductor::new();
-        let result = tick_orchestrator(&mut state, &mut network, &conductor);
+        let result = tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert_eq!(result.sphere_count, 5);
         // Should have r history
         assert_eq!(state.r_history.len(), 1);
@@ -485,7 +512,7 @@ mod tests {
         let (mut state, mut network) = make_state_with_spheres(5);
         let conductor = Conductor::new();
         for _ in 0..10 {
-            tick_orchestrator(&mut state, &mut network, &conductor);
+            tick_orchestrator(&mut state, &mut network, &conductor, None);
         }
         for sphere in state.spheres.values() {
             assert!(
@@ -501,7 +528,7 @@ mod tests {
         let (mut state, mut network) = make_state_with_spheres(3);
         let conductor = Conductor::new();
         for _ in 0..5 {
-            tick_orchestrator(&mut state, &mut network, &conductor);
+            tick_orchestrator(&mut state, &mut network, &conductor, None);
         }
         assert_eq!(state.r_history.len(), 5);
     }
@@ -510,7 +537,7 @@ mod tests {
     fn tick_records_decisions() {
         let (mut state, mut network) = make_state_with_spheres(3);
         let conductor = Conductor::new();
-        tick_orchestrator(&mut state, &mut network, &conductor);
+        tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert_eq!(state.decision_history.len(), 1);
     }
 
@@ -518,7 +545,7 @@ mod tests {
     fn tick_caches_field_state() {
         let (mut state, mut network) = make_state_with_spheres(3);
         let conductor = Conductor::new();
-        tick_orchestrator(&mut state, &mut network, &conductor);
+        tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert!(state.cached_field.is_some());
     }
 
@@ -527,7 +554,7 @@ mod tests {
         let (mut state, mut network) = make_state_with_spheres(2);
         let conductor = Conductor::new();
         state.warmup_remaining = 3;
-        tick_orchestrator(&mut state, &mut network, &conductor);
+        tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert_eq!(state.warmup_remaining, 2);
     }
 
@@ -535,7 +562,7 @@ mod tests {
     fn tick_phase_timings_non_negative() {
         let (mut state, mut network) = make_state_with_spheres(5);
         let conductor = Conductor::new();
-        let result = tick_orchestrator(&mut state, &mut network, &conductor);
+        let result = tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert!(result.phase_timings.sphere_step_ms >= 0.0);
         assert!(result.phase_timings.coupling_ms >= 0.0);
         assert!(result.phase_timings.field_state_ms >= 0.0);
@@ -664,14 +691,14 @@ mod tests {
             .proposal_manager
             .vote(&proposal_id, pid("s2"), VoteChoice::Approve, 2)
             .unwrap();
-        // Process to close and approve (window=24, need to advance past it)
-        state.proposal_manager.process(30, 3);
+        // Process to close and approve (window=200, need to advance past it)
+        state.proposal_manager.process(210, 3);
 
         // Verify proposal is approved but not yet applied
         assert_eq!(state.proposal_manager.approved_unapplied().len(), 1);
 
         // Run tick — governance actuator should apply the proposal
-        tick_orchestrator(&mut state, &mut network, &conductor);
+        tick_orchestrator(&mut state, &mut network, &conductor, None);
 
         // r_target_override should be set
         assert!(state.r_target_override.is_some());
@@ -787,7 +814,7 @@ mod tests {
         let (mut state, mut network) = make_state_with_spheres(5);
         let conductor = Conductor::new();
         for _ in 0..20 {
-            let result = tick_orchestrator(&mut state, &mut network, &conductor);
+            let result = tick_orchestrator(&mut state, &mut network, &conductor, None);
             assert!(result.total_ms >= 0.0);
             assert!(result.order_parameter.r >= 0.0);
             assert!(result.order_parameter.r <= 1.0 + 1e-10);
@@ -801,7 +828,7 @@ mod tests {
         let (mut state, mut network) = make_state_with_spheres(10);
         let conductor = Conductor::new();
         for _ in 0..50 {
-            tick_orchestrator(&mut state, &mut network, &conductor);
+            tick_orchestrator(&mut state, &mut network, &conductor, None);
         }
         for sphere in state.spheres.values() {
             assert!(
@@ -818,7 +845,7 @@ mod tests {
         let (mut state, mut network) = make_state_with_spheres(5);
         let conductor = Conductor::new();
         for _ in 0..100 {
-            tick_orchestrator(&mut state, &mut network, &conductor);
+            tick_orchestrator(&mut state, &mut network, &conductor, None);
         }
         // After 100 ticks with coupling, r should have settled
         let final_r = state.r_history.back().copied().unwrap_or(0.0);
@@ -833,7 +860,7 @@ mod tests {
             sphere.record_memory("Read".into(), "file".into());
         }
         let conductor = Conductor::new();
-        let result = tick_orchestrator(&mut state, &mut network, &conductor);
+        let result = tick_orchestrator(&mut state, &mut network, &conductor, None);
         assert!(result.sphere_count > 0);
     }
 
@@ -841,7 +868,7 @@ mod tests {
     fn tick_total_ms_sums_phases() {
         let (mut state, mut network) = make_state_with_spheres(3);
         let conductor = Conductor::new();
-        let result = tick_orchestrator(&mut state, &mut network, &conductor);
+        let result = tick_orchestrator(&mut state, &mut network, &conductor, None);
         let sum = result.phase_timings.sphere_step_ms
             + result.phase_timings.coupling_ms
             + result.phase_timings.field_state_ms

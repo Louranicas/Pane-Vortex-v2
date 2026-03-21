@@ -8,9 +8,48 @@
 2. **Run `/deephabitat`** — loads deep substrate: yazi, btm, bacon, MCP, pipe protocol, autocmds, cross-DB, vault nav, 55 custom binaries, all bridge details
 3. **Read this file** — `CLAUDE.local.md` — implementation status, phase tracking, traps to avoid
 
-**After bootstrap, WAIT for user to type `start coding` before writing ANY Rust implementation code.**
+**After bootstrap, WAIT for user to type `deploy plan` before taking ANY action.**
 
-Bootstrap gives you god-tier understanding. But code changes require explicit authorization.
+Bootstrap gives you god-tier understanding. But deployment and code changes require explicit authorization via `deploy plan`.
+
+---
+
+## Session 047 — Fleet Orchestration Complete (2026-03-21)
+
+**Status:** 85 arena files (788KB, 13,877 lines) from 9 Claude instances across 10+ waves.
+**Tests:** 1,527 (unchanged from Session 046b)
+**Health:** 49/100 current → 78/100 projected with V2 deploy
+
+### Bugs Discovered (Session 047)
+- **BUG-034** POVM write-only pathology (access_count=0 all memories)
+- **BUG-035** ME emergence cap 1000/1000 deadlocked (CRITICAL)
+- **BUG-036** library-agent ghost probing (7,838 failures)
+- **BUG-037** SYNTHEX thermal feedback decoupled on V1
+
+### Breakthroughs
+- SYNTHEX `POST /api/ingest` is WRITABLE (thermal injection vector)
+- Cross-service synergy matrix mapped (PV-SYNTHEX 0.82 strongest)
+- 10 hook points identified (40-50% automation)
+- 23 code integration points across 7 files
+- 5 synergies: POVM crystallisation, RM-ME corridor, harmonic damping, governance auto-voting, bus diversity
+
+### Session 048 Remediation Plan
+**Plan file:** `.claude/plans/zesty-shimmying-fountain.md`
+**Also at:** `ai_docs/SESSION_048_REMEDIATION_PLAN.md` and `vault/Session 048 — Remediation Plan.md`
+
+**Execution: `deploy plan` triggers Blocks A→I**
+1. Block 0: Bootstrap (/primehabitat + /deephabitat + habitat-probe pulse)
+2. Block A: Commit 847 lines + backup V1 + locate ME config + probe POVM schema
+3. Block B: Build V2 + hot-swap + restart (closes thermal loop)
+4. Block C: ME emergence_cap 1000→5000 + remove library-agent (parallel with B)
+5. Block D: Unblock 7 spheres + verify 7 MVP routes + SYNTHEX injection test
+6. Block E: Wire Executor + spawn_bridge_posts + V3.2 inhabitation smoke test
+7. Block F: POVM hydration read-back + Hebbian co-activation + session tagging
+8. Block G: 5 hooks (UserPromptSubmit, SessionStart, PostToolUse, PreToolUse, Stop)
+9. Block H: 4 synergies (auto-voting, crystallisation, harmonic damping, voting window)
+10. Block I: Phase 2-3 integration (16 routes) + dashboards + SubagentStop hook
+
+**Rollback:** `\cp -f ./bin/pane-vortex.v1.bak ./bin/pane-vortex && devenv restart pane-vortex`
 
 ---
 
@@ -26,58 +65,69 @@ Bootstrap gives you god-tier understanding. But code changes require explicit au
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| V3.1 | Diagnostics & Repair | NEXT (after `start coding`) |
-| V3.2 | Inhabitation | BLOCKED by V3.1 |
-| V3.3 | Sovereignty | BLOCKED by V3.2 |
-| V3.4 | Governance | BLOCKED by V3.3 |
+| V3.1 | Diagnostics & Repair | DONE (Session 045) |
+| V3.2 | Inhabitation | READY (ghost reincarnation coded) |
+| V3.3 | Sovereignty | CODED (GAP-3/4 consent fixes, needs V2 deploy) |
+| V3.4 | Governance | CODED (GAP-1/2/5/6/7, 5 API routes, needs V2 deploy) |
 | V3.5 | Consolidation | PARALLEL with V3.2+ |
 
-## The `start coding` Command
+## Session 045 — Remediation COMPLETE, Deploy V2 Binary (2026-03-21)
 
-When user types **`start coding`**, execute in this order:
+**Status:** ALL CODE COMPLETE — V2 binary NOT yet deployed to live daemon
+**Commits:** `73314ad` (remediation) → `ea06b35` (BUG-029) → `6fa51d9` (BUG-031) → `a722a6b` (BUG-028)
+**Tests:** 1,516 (was 1,379, +137)
+**Obsidian:** `[[Session 045 — Remediation Plan Deployment]]`, `[[Session 045 — Sidecar and Fleet Failure Analysis]]`
+**POVM:** `a33eca4a` (deployment), `376dd9e7` (sidecar), `91ea60f4` (failure analysis)
+**RM:** `r69bdb76b01f8` (deployment), `r69bdc5b40201` (synthesis), `r69bdda5f023a` (failure analysis)
 
-1. Verify quality gate passes (cargo check + clippy + pedantic + test)
-2. Read `MASTERPLAN.md` Phase V3.1 items
-3. Begin implementation layers bottom-up (see Implementation Order below)
-4. Quality gate after EVERY module — zero tolerance, never suppress warnings
-5. Commit after each completed layer
+### What Was Coded (Session 045)
+- **7 GAPs closed:** GAP-1 governance actuator, GAP-2 runtime budget, GAP-3 6-bridge consent, GAP-4 divergence exemption, GAP-5 sphere override, GAP-6 opt-out policy, GAP-7 voting window 5→24
+- **5 bugs fixed:** BUG-027 stuck cp, BUG-028 V1 sidecar wire compat, BUG-029 client arg parse, BUG-030 unblocked, BUG-031 Hebbian STDP wired to tick Phase 2.5
+- **Architecture:** IQR K-scaling, ghost reincarnation, multiplicative conductor/bridge composition, EMA decay α=0.95, ProposalManager persistence
+- **5 governance API routes:** /field/propose, /field/proposals, /sphere/{id}/vote/{proposal_id}, /sphere/{id}/consent, /sphere/{id}/data-manifest
 
-## Implementation Order (within `start coding`)
+### What Needs Deploying (NEXT SESSION — via `deploy plan`)
+The live daemon runs V1 binary (`./bin/pane-vortex`, PID from Mar 20). All V2 code exists only in source.
 
-### Phase 1: L1 Foundation (m01-m06)
-1. m01_core_types — Point3D, PaneId, SphereMemory, Buoy, Phase, Frequency
-2. m02_error_handling — PvError enum, PvResult type alias, From impls
-3. m03_config — Figment-based config from default.toml + env vars
-4. m04_constants — All named constants from config/default.toml
-5. m05_traits — Oscillator, Learnable, Bridgeable, Consentable traits
-6. m06_validation — Input validators (phase bounds, freq clamp, string limits)
-**Quality gate after each module. 50+ tests for L1.**
+## The `deploy plan` Command
 
-### Phase 2: L3 Field (m11-m15) — before L2 because L2 needs L3 types
-1. m11_sphere — PaneSphere (33 fields from v1, refactored)
-2. m12_field_state — FieldState, FieldDecision, tunnels
-3. m13_chimera — Phase-gap detection
-4. m14_messaging — PhaseMessage variants
-5. m15_app_state — SharedState with Arc<RwLock>
+When user types **`deploy plan`**, execute in this order:
 
-### Phase 3: L4 Coupling + L5 Learning
-1. m16-m18 coupling network
-2. m19-m21 Hebbian STDP
+**Step 0 — Bootstrap:**
+1. Run `/primehabitat` — loads full Habitat knowledge
+2. Run `/deephabitat` — loads substrate knowledge
+3. Run `habitat-probe pulse` — verify PV + POVM + ME live
+4. Run `fleet-ctl status` — verify fleet pane state
 
-### Phase 4: L2 Services (m07-m10)
-1. m07 service registry
-2. m08 health monitor
-3. m09 lifecycle
-4. m10 API server (axum routes)
+**Step 1 — Verify codebase:**
+5. Read this file (`CLAUDE.local.md`) — confirm Session 045 state
+6. Read `vault/Session 044 — Deep Synthesis.md` for architectural context
+7. Run quality gate — confirm 1,516 tests pass, zero warnings
+8. Verify 4 commits exist: `git log --oneline -4`
 
-### Phase 5: L6 Bridges (m22-m28)
-All 6 service bridges + consent gate
+**Step 2 — Build V2 release:**
+9. `CARGO_TARGET_DIR=/tmp/cargo-pv2 cargo build --release 2>&1 | tail -5`
 
-### Phase 6: L7 Coordination (m29-m36)
-IPC bus, conductor, executor, tick orchestrator, persistence
+**Step 3 — Deploy V2 binary (ULTRAPLATE convention):**
+10. Hot-swap BOTH paths (devenv uses `./bin/`, hooks use `~/.local/bin/`):
+    ```bash
+    \cp -f /tmp/cargo-pv2/release/pane-vortex ./bin/pane-vortex
+    \cp -f /tmp/cargo-pv2/release/pane-vortex ~/.local/bin/pane-vortex
+    ```
+11. Restart via devenv: `~/.local/bin/devenv -c ~/.config/devenv/devenv.toml restart pane-vortex`
 
-### Phase 7: L8 Governance (m37-m41) — feature-gated
-Proposals, voting, consent declaration, data sovereignty
+**Step 4 — Verify V2 is live (5 checks):**
+12. `curl -s localhost:8132/health | jq '{status, tick}'` — healthy
+13. `curl -s -o /dev/null -w '%{http_code}' localhost:8132/field/proposals` — **200 (not 404)**
+14. `tail -5 /tmp/swarm-sidecar.log` — sustained session (no "bus disconnected")
+15. `curl -s localhost:8132/coupling/matrix | jq '[.matrix[].weight] | unique | length'` — should show weight differentiation after Hebbian ticks
+16. `habitat-probe sweep` — 16/16 healthy
+
+**Step 5 — Post-deploy:**
+17. Record to RM + POVM
+18. Save to Obsidian vault
+19. Update devenv.toml description: `1516 tests | 38 API routes`
+20. Continue with V3.2 Inhabitation or other tasks
 
 ## Gold Standard Reference
 
@@ -97,12 +147,16 @@ Proposals, voting, consent declaration, data sovereignty
 ## Traps to Avoid
 
 1. Never chain after pkill (exit 144)
-2. Always `\cp -f` (cp aliased)
+2. Always `\cp -f` (cp aliased — BUG-027 killed 2 stuck processes)
 3. TSV only for Reasoning Memory
 4. Lock ordering: AppState before BusState
 5. Phase wrapping: `.rem_euclid(TAU)` always
 6. No stdout in daemons (SIGPIPE death)
-7. BUG-008: ME EventBus has zero publishers — highest-impact fix in V3.1
+7. BUG-008: ME EventBus — subscriber_count=0 is cosmetic, not the real issue
+8. fleet-ctl cache is STALE (300s TTL) — screen dump is ONLY reliable pane state source
+9. PV sphere status LAGS — hooks don't always fire on session end
+10. Running daemon is V1 binary at `./bin/pane-vortex` — V2 at `~/.local/bin/` needs explicit deploy
+11. Sidecar (V1 binary) disconnects after handshake until V2 deployed (BUG-028 fix in code)
 
 ## Working Directory
 `/home/louranicas/claude-code-workspace/pane-vortex-v2`

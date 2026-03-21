@@ -107,30 +107,71 @@ pub enum VoteChoice {
 // ──────────────────────────────────────────────────────────────
 
 /// Manages the lifecycle of governance proposals.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalManager {
     /// Active and archived proposals.
     proposals: HashMap<String, Proposal>,
     /// Maximum active proposals.
+    #[serde(default = "default_max_active")]
     max_active: usize,
     /// Voting window in ticks.
+    #[serde(default = "default_voting_window")]
     voting_window: u64,
     /// Quorum threshold (fraction of active spheres).
+    #[serde(default = "default_quorum_threshold")]
     quorum_threshold: f64,
+}
+
+/// BUG-032 fix: serde default for `max_active` (was 0 via `derive(Default)`).
+const fn default_max_active() -> usize {
+    100
+}
+
+/// BUG-032 fix: serde default for `voting_window`.
+/// H4: widened from 24→200 ticks (1000s at 5s/tick) to allow fleet-scale voting.
+const fn default_voting_window() -> u64 {
+    200
+}
+
+/// BUG-032 fix: serde default for `quorum_threshold`.
+const fn default_quorum_threshold() -> f64 {
+    0.5
+}
+
+impl Default for ProposalManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProposalManager {
     /// Create a new proposal manager with default config.
     ///
-    /// Voting window is 24 ticks (120s at 5s/tick) to accommodate
-    /// Nexus bridge 60-tick poll interval (GAP-7 fix).
+    /// Voting window is 200 ticks (1000s at 5s/tick) — H4 widening
+    /// from 24 to allow fleet-scale voting across all spheres.
     #[must_use]
     pub fn new() -> Self {
         Self {
             proposals: HashMap::new(),
             max_active: m04_constants::DECISION_HISTORY_MAX, // 100
-            voting_window: 24,
+            voting_window: 200,
             quorum_threshold: 0.5,
+        }
+    }
+
+    /// Fix zero-valued config fields after snapshot restore (BUG-032).
+    ///
+    /// Snapshots serialized before the fix contain `max_active=0`, which
+    /// permanently locks governance. This method ensures operational defaults.
+    pub fn reconcile(&mut self) {
+        if self.max_active == 0 {
+            self.max_active = default_max_active();
+        }
+        if self.voting_window == 0 {
+            self.voting_window = default_voting_window();
+        }
+        if self.quorum_threshold <= 0.0 {
+            self.quorum_threshold = default_quorum_threshold();
         }
     }
 

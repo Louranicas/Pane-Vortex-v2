@@ -54,21 +54,45 @@ const MAX_RESPONSE_SIZE: usize = 8192;
 // ──────────────────────────────────────────────────────────────
 
 /// Response from the SYNTHEX `/v3/thermal` endpoint.
+///
+/// BUG-033 fix: matches actual SYNTHEX V3 API response format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThermalResponse {
-    /// Thermal adjustment factor for coupling modulation.
-    pub thermal_adjustment: f64,
-    /// Current thermal state label (e.g. "nominal", "elevated", "critical").
+    /// Current temperature reading.
+    pub temperature: f64,
+    /// Target temperature (PID setpoint).
+    pub target: f64,
+    /// PID controller output.
+    pub pid_output: f64,
+    /// Heat source readings (HS-001 through HS-004).
     #[serde(default)]
-    pub state: String,
-    /// Confidence in the thermal reading (0.0-1.0).
-    #[serde(default = "default_confidence")]
-    pub confidence: f64,
+    pub heat_sources: Vec<HeatSource>,
 }
 
-/// Default confidence when not provided by SYNTHEX.
-const fn default_confidence() -> f64 {
-    1.0
+/// A single SYNTHEX heat source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeatSource {
+    /// Heat source identifier (e.g. "HS-001").
+    pub id: String,
+    /// Current reading value.
+    pub reading: f64,
+    /// Weight in the composite temperature.
+    pub weight: f64,
+}
+
+impl ThermalResponse {
+    /// Compute the thermal k-adjustment from temperature deviation.
+    ///
+    /// V1 pattern: `(1.0 - deviation * 0.2).clamp(0.8, 1.2)`
+    /// Cold → boost coupling (>1.0), hot → reduce coupling (<1.0).
+    #[must_use]
+    pub fn thermal_adjustment(&self) -> f64 {
+        let deviation = self.temperature - self.target;
+        deviation.mul_add(-0.2, 1.0).clamp(
+            m04_constants::K_MOD_BUDGET_MIN,
+            m04_constants::K_MOD_BUDGET_MAX,
+        )
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -202,15 +226,14 @@ impl SynthexBridge {
             }
         })?;
 
-        let adj = response.thermal_adjustment;
-        if !adj.is_finite() {
+        // Compute adjustment from temperature/target deviation (BUG-033 fix)
+        let clamped = response.thermal_adjustment();
+        if !clamped.is_finite() {
             return Err(PvError::BridgeParse {
                 service: self.service.clone(),
-                reason: format!("non-finite thermal_adjustment: {adj}"),
+                reason: format!("non-finite thermal_adjustment: {clamped}"),
             });
         }
-
-        let clamped = adj.clamp(m04_constants::K_MOD_BUDGET_MIN, m04_constants::K_MOD_BUDGET_MAX);
 
         {
             let mut state = self.state.write();
@@ -574,37 +597,42 @@ mod tests {
         assert_eq!(bridge.consecutive_failures(), u32::MAX);
     }
 
-    // ── ThermalResponse serde ──
+    // ── ThermalResponse serde (BUG-033 fix: matches actual SYNTHEX API) ──
+
+    fn test_thermal_response() -> ThermalResponse {
+        ThermalResponse {
+            temperature: 0.572,
+            target: 0.5,
+            pid_output: 0.136,
+            heat_sources: vec![
+                HeatSource { id: "HS-001".into(), reading: 1.0, weight: 0.3 },
+                HeatSource { id: "HS-002".into(), reading: 0.0, weight: 0.35 },
+            ],
+        }
+    }
 
     #[test]
     fn thermal_response_deserialize_full() {
-        let json = r#"{"thermal_adjustment": 1.05, "state": "nominal", "confidence": 0.95}"#;
+        let json = r#"{"temperature":0.572,"target":0.5,"pid_output":0.136,"heat_sources":[{"id":"HS-001","reading":1.0,"weight":0.3}]}"#;
         let resp: ThermalResponse = serde_json::from_str(json).unwrap();
-        assert!((resp.thermal_adjustment - 1.05).abs() < f64::EPSILON);
-        assert_eq!(resp.state, "nominal");
-        assert!((resp.confidence - 0.95).abs() < f64::EPSILON);
+        assert!((resp.temperature - 0.572).abs() < 1e-6);
+        assert!((resp.target - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn thermal_response_deserialize_minimal() {
-        let json = r#"{"thermal_adjustment": 0.9}"#;
+        let json = r#"{"temperature":0.5,"target":0.5,"pid_output":0.0}"#;
         let resp: ThermalResponse = serde_json::from_str(json).unwrap();
-        assert!((resp.thermal_adjustment - 0.9).abs() < f64::EPSILON);
-        assert_eq!(resp.state, "");
-        assert!((resp.confidence - 1.0).abs() < f64::EPSILON);
+        assert!(resp.heat_sources.is_empty());
     }
 
     #[test]
     fn thermal_response_serialize_roundtrip() {
-        let resp = ThermalResponse {
-            thermal_adjustment: 1.1,
-            state: "elevated".to_owned(),
-            confidence: 0.8,
-        };
+        let resp = test_thermal_response();
         let json = serde_json::to_string(&resp).unwrap();
         let back: ThermalResponse = serde_json::from_str(&json).unwrap();
-        assert!((back.thermal_adjustment - 1.1).abs() < f64::EPSILON);
-        assert_eq!(back.state, "elevated");
+        assert!((back.temperature - 0.572).abs() < 1e-6);
+        assert_eq!(back.heat_sources.len(), 2);
     }
 
     #[test]
@@ -612,6 +640,32 @@ mod tests {
         let json = r#"{"not_a_field": 42}"#;
         let result = serde_json::from_str::<ThermalResponse>(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn thermal_adjustment_cold_boosts() {
+        let resp = ThermalResponse {
+            temperature: 0.3, target: 0.5, pid_output: 0.0, heat_sources: vec![],
+        };
+        // deviation = -0.2, adj = 1.0 - (-0.2 * 0.2) = 1.04
+        assert!(resp.thermal_adjustment() > 1.0);
+    }
+
+    #[test]
+    fn thermal_adjustment_hot_reduces() {
+        let resp = ThermalResponse {
+            temperature: 0.8, target: 0.5, pid_output: 0.0, heat_sources: vec![],
+        };
+        // deviation = 0.3, adj = 1.0 - (0.3 * 0.2) = 0.94
+        assert!(resp.thermal_adjustment() < 1.0);
+    }
+
+    #[test]
+    fn thermal_adjustment_at_target_is_neutral() {
+        let resp = ThermalResponse {
+            temperature: 0.5, target: 0.5, pid_output: 0.0, heat_sources: vec![],
+        };
+        assert!((resp.thermal_adjustment() - 1.0).abs() < f64::EPSILON);
     }
 
     // ── HTTP helpers ──
@@ -847,11 +901,7 @@ mod tests {
 
     #[test]
     fn thermal_response_debug() {
-        let resp = ThermalResponse {
-            thermal_adjustment: 1.0,
-            state: "nominal".to_owned(),
-            confidence: 1.0,
-        };
+        let resp = test_thermal_response();
         let debug = format!("{resp:?}");
         assert!(debug.contains("ThermalResponse"));
     }

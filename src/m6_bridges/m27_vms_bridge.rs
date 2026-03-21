@@ -252,6 +252,7 @@ impl VmsBridge {
         let mut state = self.state.write();
         state.snapshots_posted = state.snapshots_posted.saturating_add(1);
         state.consecutive_failures = 0;
+        state.stale = false;
         Ok(())
     }
 

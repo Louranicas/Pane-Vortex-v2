@@ -345,6 +345,13 @@ zellij action write 13 && zellij action go-to-tab 1
 
 ---
 
+## ARCHITECTURE & SCHEMATICS
+
+For skill architecture, progressive disclosure model, habitat-probe design, gotchas flywheel, and token budget analysis:
+`~/projects/claude_code/Session 042 — Habitat Skills Architecture and Progressive Disclosure.md`
+
+Run `habitat-probe --help` for the compiled Rust probe binary (replaces inline curl chains, 0 context tokens).
+
 ## THE HABITAT
 
 Named by Claude, Session 039. Luke: "then home it is."

@@ -177,6 +177,10 @@ pub struct BusState {
     cascade_limiter: CascadeRateLimiter,
     /// Set of completed/failed task IDs for deduplication.
     completed_task_ids: HashSet<String>,
+    /// Field-driven suggestions (ring buffer, max 50).
+    suggestions: VecDeque<serde_json::Value>,
+    /// Total suggestions generated across all ticks.
+    total_suggestions: u64,
 }
 
 impl BusState {
@@ -189,6 +193,8 @@ impl BusState {
             subscribers: HashMap::new(),
             cascade_limiter: CascadeRateLimiter::new(),
             completed_task_ids: HashSet::new(),
+            suggestions: VecDeque::with_capacity(50),
+            total_suggestions: 0,
         }
     }
 
@@ -323,6 +329,29 @@ impl BusState {
             }
             true
         });
+    }
+
+    // ── Suggestion management ──
+
+    /// Add a field-driven suggestion (ring buffer, max 50).
+    pub fn add_suggestion(&mut self, suggestion: serde_json::Value) {
+        self.suggestions.push_back(suggestion);
+        self.total_suggestions = self.total_suggestions.saturating_add(1);
+        while self.suggestions.len() > 50 {
+            self.suggestions.pop_front();
+        }
+    }
+
+    /// Return the most recent suggestions (up to `n`).
+    #[must_use]
+    pub fn recent_suggestions(&self, n: usize) -> Vec<&serde_json::Value> {
+        self.suggestions.iter().rev().take(n).collect()
+    }
+
+    /// Return total suggestions generated across all ticks.
+    #[must_use]
+    pub const fn total_suggestions(&self) -> u64 {
+        self.total_suggestions
     }
 
     // ── Event management ──
@@ -984,7 +1013,7 @@ async fn handle_frame(
     frame: BusFrame,
     tx: &mpsc::Sender<String>,
     session_id: &str,
-    _state: &SharedState,
+    state: &SharedState,
     bus_state: &Arc<RwLock<BusState>>,
 ) -> PvResult<bool> {
     // Check if this subscriber uses V1 wire format (BUG-028 fix)
@@ -1023,8 +1052,48 @@ async fn handle_frame(
         BusFrame::Submit { task } => {
             let task_id = {
                 let mut bus = bus_state.write();
-                bus.submit_task(task)?
+                bus.submit_task(task.clone())?
             };
+
+            // E1: Dispatch via Executor using field state
+            {
+                let mut executor = super::m32_executor::Executor::new();
+                let spheres = state.read().spheres.clone();
+                match executor.execute(&task, &spheres) {
+                    Ok(result) if result.success => {
+                        let mut bus = bus_state.write();
+                        let _ = bus.claim_task(&task_id, result.target_sphere.clone());
+                        bus.publish_event(BusEvent::new(
+                            "task.dispatched".to_owned(),
+                            serde_json::json!({
+                                "task_id": task_id.as_str(),
+                                "target": result.target_sphere.as_str(),
+                                "ms": result.execution_ms,
+                            }),
+                            0,
+                        ));
+                        debug!(
+                            task_id = %task_id,
+                            target = %result.target_sphere,
+                            "executor dispatched task"
+                        );
+                    }
+                    Ok(result) => {
+                        debug!(
+                            task_id = %task_id,
+                            reason = %result.reason,
+                            "executor dispatch failed — task remains pending"
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            task_id = %task_id,
+                            error = %e,
+                            "executor error — task remains pending"
+                        );
+                    }
+                }
+            }
 
             if is_v1 {
                 let line = serde_json::to_string(&serde_json::json!({

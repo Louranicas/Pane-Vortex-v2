@@ -95,6 +95,13 @@ pub struct MemoryRequest {
     pub summary: String,
 }
 
+/// Request body for `POST /sphere/{pane_id}/accept-ghost`.
+#[derive(Debug, Deserialize)]
+pub struct AcceptGhostRequest {
+    /// ID of the ghost to accept.
+    pub ghost_id: String,
+}
+
 /// Request body for `POST /sphere/{pane_id}/status`.
 #[derive(Debug, Deserialize)]
 pub struct StatusRequest {
@@ -244,7 +251,15 @@ fn parse_status(s: &str) -> Result<PaneStatus, PvError> {
 async fn health_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
     let (r, sphere_count, tick, fleet_mode, warmup) = {
         let guard = ctx.state.read();
-        let r = guard.r_history.back().copied().unwrap_or(0.0);
+        // Use cached field state (computed every tick) for accurate r.
+        // Falls back to r_history for backward compat during warmup.
+        let r = guard
+            .cached_field
+            .as_ref()
+            .map_or_else(
+                || guard.r_history.back().copied().unwrap_or(0.0),
+                |fs| fs.order_parameter.r,
+            );
         (r, guard.spheres.len(), guard.tick, guard.fleet_mode(), guard.warmup_remaining)
     };
 
@@ -330,9 +345,12 @@ async fn field_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
 /// GET /field/r -- Current order parameter r.
 async fn field_r_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
     let (r, psi) = {
-        let net = ctx.network.read();
-        let op = net.order_parameter();
-        (op.r, op.psi)
+        let guard = ctx.state.read();
+        // Use cached field state for accurate r (matches /field endpoint).
+        guard
+            .cached_field
+            .as_ref()
+            .map_or((0.0, 0.0), |fs| (fs.order_parameter.r, fs.order_parameter.psi))
     };
     Json(serde_json::json!({
         "r": r,
@@ -606,6 +624,43 @@ async fn deregister_handler(
     })))
 }
 
+/// POST `/sphere/{pane_id}/accept-ghost` -- Accept a ghost trace.
+///
+/// Consumes the ghost (removes from ghost list) and returns its data.
+/// The calling sphere can use the ghost's memory count and tool history
+/// to bootstrap its own state.
+async fn accept_ghost_handler(
+    State(ctx): State<AppContext>,
+    Path(pane_id): Path<String>,
+    Json(body): Json<AcceptGhostRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_pane_id(&pane_id)?;
+
+    let pid = PaneId::new(&pane_id);
+    let ghost_pid = PaneId::new(&body.ghost_id);
+
+    let mut guard = ctx.state.write();
+
+    // Verify the accepting sphere exists
+    if !guard.spheres.contains_key(&pid) {
+        return Err(ApiError(PvError::SphereNotFound(pane_id)));
+    }
+
+    // Consume the ghost
+    let ghost = guard
+        .accept_ghost(&ghost_pid)
+        .ok_or_else(|| PvError::SphereNotFound(body.ghost_id.clone()))?;
+
+    Ok(Json(serde_json::json!({
+        "accepted_by": pane_id,
+        "ghost_id": ghost.id.as_str(),
+        "ghost_persona": ghost.persona,
+        "ghost_steps": ghost.total_steps_lived,
+        "ghost_memory_count": ghost.memory_count,
+        "ghost_top_tools": ghost.top_tools,
+    })))
+}
+
 /// POST `/sphere/{pane_id}/memory` -- Record a memory.
 async fn memory_handler(
     State(ctx): State<AppContext>,
@@ -785,10 +840,12 @@ async fn steer_handler(
 }
 
 /// GET /bus/suggestions -- Field-driven suggestions (Gap 3 — stub).
-async fn bus_suggestions_handler(State(_ctx): State<AppContext>) -> impl IntoResponse {
+async fn bus_suggestions_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
+    let bus = ctx.bus.read();
+    let suggestions: Vec<&serde_json::Value> = bus.recent_suggestions(20);
     Json(serde_json::json!({
-        "suggestions": [],
-        "total_generated": 0,
+        "suggestions": suggestions,
+        "total_generated": bus.total_suggestions(),
     }))
 }
 
@@ -1421,6 +1478,10 @@ pub fn build_router(ctx: AppContext) -> Router {
         .route("/sphere/{pane_id}", get(sphere_detail_handler))
         .route("/sphere/{pane_id}/register", post(register_handler))
         .route("/sphere/{pane_id}/deregister", post(deregister_handler))
+        .route(
+            "/sphere/{pane_id}/accept-ghost",
+            post(accept_ghost_handler),
+        )
         .route("/sphere/{pane_id}/memory", post(memory_handler))
         .route("/sphere/{pane_id}/status", post(status_handler))
         .route("/sphere/{pane_id}/heartbeat", post(heartbeat_handler))

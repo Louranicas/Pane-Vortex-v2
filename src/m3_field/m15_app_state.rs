@@ -240,6 +240,9 @@ impl AppState {
             sphere.reconcile_after_restore();
         }
         self.warmup_remaining = m04_constants::WARMUP_TICKS;
+
+        // BUG-032 fix: ensure ProposalManager has valid config after restore.
+        self.proposal_manager.reconcile();
     }
 
     /// Sphere count.

@@ -256,6 +256,7 @@ impl PovmBridge {
         raw_http_post(&self.base_url, MEMORIES_PATH, payload, &self.service)?;
         let mut state = self.state.write();
         state.consecutive_failures = 0;
+        state.stale = false;
         Ok(())
     }
 
@@ -378,8 +379,14 @@ impl Bridgeable for PovmBridge {
 
     fn is_stale(&self, current_tick: u64) -> bool {
         let state = self.state.read();
-        state.stale
-            || current_tick.saturating_sub(state.last_write_tick) >= self.write_interval * 3
+        if state.stale {
+            return true;
+        }
+        // Consider both write and read activity — either proves the bridge is alive.
+        // Use 4x write_interval (not 3x) because write and read fire at different
+        // tick offsets, creating gaps that exceed 3x during normal operation.
+        let last_activity = state.last_write_tick.max(state.last_read_tick);
+        current_tick.saturating_sub(last_activity) >= self.write_interval * 4
     }
 }
 
@@ -654,26 +661,27 @@ mod tests {
     }
 
     #[test]
-    fn stale_after_triple_write_interval() {
+    fn stale_after_quadruple_write_interval() {
         let bridge = PovmBridge::with_config("localhost:8125", 10, 60);
         bridge.set_last_write_tick(5);
         {
             let mut state = bridge.state.write();
             state.stale = false;
         }
-        // 35 - 5 = 30 >= 10*3 = 30 → stale
-        assert!(bridge.is_stale(35));
+        // 45 - 5 = 40 >= 10*4 = 40 → stale
+        assert!(bridge.is_stale(45));
     }
 
     #[test]
-    fn not_stale_within_triple_interval() {
+    fn not_stale_within_quadruple_interval() {
         let bridge = PovmBridge::with_config("localhost:8125", 10, 60);
         bridge.set_last_write_tick(10);
         {
             let mut state = bridge.state.write();
             state.stale = false;
         }
-        assert!(!bridge.is_stale(25));
+        // 45 - 10 = 35 < 10*4 = 40 → not stale
+        assert!(!bridge.is_stale(45));
     }
 
     // ── Failure tracking ──

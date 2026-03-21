@@ -310,6 +310,7 @@ impl RmBridge {
         let mut state = self.state.write();
         state.records_posted = state.records_posted.saturating_add(1);
         state.consecutive_failures = 0;
+        state.stale = false;
         Ok(())
     }
 
@@ -420,7 +421,7 @@ impl Bridgeable for RmBridge {
 
     fn is_stale(&self, current_tick: u64) -> bool {
         let state = self.state.read();
-        state.stale || current_tick.saturating_sub(state.last_poll_tick) >= self.poll_interval * 2
+        state.stale || current_tick.saturating_sub(state.last_poll_tick) >= self.poll_interval * 3
     }
 }
 

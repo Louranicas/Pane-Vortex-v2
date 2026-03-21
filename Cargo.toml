@@ -21,6 +21,10 @@ name = "habitat-probe"
 path = "src/bin/probe.rs"
 
 [[bin]]
+name = "fleet-verify"
+path = "src/bin/fleet_verify.rs"
+
+[[bin]]
 name = "scaffold-gen"
 path = "src/bin/scaffold.rs"
 
