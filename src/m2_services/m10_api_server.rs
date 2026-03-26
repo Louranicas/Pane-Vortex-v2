@@ -536,6 +536,23 @@ async fn register_handler(
         net.register(pid, phase, freq);
     }
 
+    // GAP-1 fix: Broadcast sphere.registered to IPC bus subscribers
+    {
+        let tick = ctx.state.read().tick;
+        let event = crate::m7_coordination::m30_bus_types::BusEvent::new(
+            "sphere.registered".to_owned(),
+            serde_json::json!({
+                "sphere_id": pane_id,
+                "persona": body.persona,
+                "frequency": freq,
+                "ghost_restored": ghost_restored,
+                "tick": tick,
+            }),
+            tick,
+        );
+        ctx.bus.write().publish_event(event);
+    }
+
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -613,6 +630,22 @@ async fn deregister_handler(
     {
         let mut net = ctx.network.write();
         net.deregister(&PaneId::new(&pane_id));
+    }
+
+    // GAP-1 fix: Broadcast sphere.deregistered to IPC bus subscribers
+    {
+        let tick = ctx.state.read().tick;
+        let event = crate::m7_coordination::m30_bus_types::BusEvent::new(
+            "sphere.deregistered".to_owned(),
+            serde_json::json!({
+                "sphere_id": pane_id,
+                "total_steps": ghost.total_steps_lived,
+                "memory_count": ghost.memory_count,
+                "tick": tick,
+            }),
+            tick,
+        );
+        ctx.bus.write().publish_event(event);
     }
 
     Ok(Json(serde_json::json!({
@@ -1107,6 +1140,82 @@ async fn bus_events_handler(State(ctx): State<AppContext>) -> impl IntoResponse 
     };
 
     Json(serde_json::json!({ "events": events }))
+}
+
+/// Request body for POST /bus/events — external event ingestion.
+///
+/// Accepts events from external services (e.g., ME `EventBus` bridge).
+/// Each event is mapped to a [`BusEvent`] with namespaced `event_type`.
+#[derive(Debug, serde::Deserialize)]
+struct EventIngestRequest {
+    /// Source service identifier (e.g., "maintenance-engine").
+    source: String,
+    /// Channel name from source (e.g., "health", "integration").
+    channel: String,
+    /// Array of event records from the source.
+    events: Vec<serde_json::Value>,
+}
+
+/// POST /bus/events -- Ingest external events into the PV2 bus.
+///
+/// Accepts ME `EventBus` bridge payload format and publishes each event
+/// into the bus ring buffer with namespaced `event_type`.
+async fn bus_events_ingest_handler(
+    State(ctx): State<AppContext>,
+    Json(body): Json<EventIngestRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::m7_coordination::m30_bus_types::BusEvent;
+
+    // Validate batch size (max 100 events per request)
+    if body.events.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "empty events array"})),
+        ));
+    }
+    let batch_size = body.events.len().min(100);
+
+    // Read current tick from field state (lock ordering: state before bus)
+    let tick = ctx.state.read().tick;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+
+    // Publish each event into the bus ring buffer
+    let mut bus = ctx.bus.write();
+    let mut ingested = 0u32;
+    for event_val in body.events.iter().take(batch_size) {
+        let me_type = event_val
+            .get("event_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        let bus_event = BusEvent {
+            event_type: format!("{}.{}.{}", body.source, body.channel, me_type),
+            data: event_val.clone(),
+            tick,
+            timestamp,
+        };
+        bus.publish_event(bus_event);
+        ingested += 1;
+    }
+    drop(bus);
+
+    tracing::info!(
+        source = body.source.as_str(),
+        channel = body.channel.as_str(),
+        ingested,
+        "External events ingested into bus"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "accepted": ingested,
+            "source": body.source,
+            "channel": body.channel,
+        })),
+    ))
 }
 
 /// POST /bus/submit -- Submit a task via HTTP (alternative to IPC socket).
@@ -1619,7 +1728,7 @@ pub fn build_router(ctx: AppContext) -> Router {
         // Bus (9)
         .route("/bus/info", get(bus_info_handler))
         .route("/bus/tasks", get(bus_tasks_handler))
-        .route("/bus/events", get(bus_events_handler))
+        .route("/bus/events", get(bus_events_handler).post(bus_events_ingest_handler))
         .route("/bus/submit", post(bus_submit_handler))
         .route("/bus/claim/{task_id}", post(bus_task_claim_handler))
         .route("/bus/complete/{task_id}", post(bus_task_complete_handler))
