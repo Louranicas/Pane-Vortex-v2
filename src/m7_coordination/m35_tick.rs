@@ -157,6 +157,13 @@ pub fn tick_orchestrator(
     tick_conductor(state, conductor, &decision, network);
     timings.conductor_ms = p4_start.elapsed().as_secs_f64() * 1000.0;
 
+    // ── Phase 4.5: Idle sphere TTL pruning (Session 066) ──
+    // Every 60 ticks, deregister idle spheres with 0 memories and age > 300 ticks.
+    // Prevents O(N^2) coupling overhead from 66+ dormant orac-agent spheres.
+    if current_tick % 60 == 0 && current_tick > 0 {
+        tick_prune_idle_spheres(state, network, current_tick);
+    }
+
     // ── Phase 5: Persistence check ──
     let p5_start = Instant::now();
     let should_snapshot = tick_persistence_check(state, current_tick);
@@ -395,6 +402,47 @@ fn tick_conductor(
 }
 
 // ──────────────────────────────────────────────────────────────
+// Phase 4.5: Idle sphere TTL pruning (Session 066)
+// ──────────────────────────────────────────────────────────────
+
+/// Prune idle spheres that have zero memories and have been alive > 300 ticks.
+///
+/// Prevents O(N^2) coupling overhead from dozens of dormant spheres that will
+/// never contribute to learning. Runs every 60 ticks from the tick orchestrator.
+fn tick_prune_idle_spheres(
+    state: &mut AppState,
+    network: &mut CouplingNetwork,
+    tick: u64,
+) {
+    use crate::m1_foundation::m01_core_types::PaneStatus;
+
+    let to_prune: Vec<PaneId> = state
+        .spheres
+        .iter()
+        .filter_map(|(id, sphere)| {
+            if sphere.status == PaneStatus::Idle
+                && sphere.memories.is_empty()
+                && sphere.total_steps > 300
+            {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if to_prune.is_empty() {
+        return;
+    }
+
+    let count = to_prune.len();
+    for id in &to_prune {
+        state.spheres.remove(id);
+        network.deregister(id);
+    }
+    tracing::info!(pruned = count, tick, "Idle sphere TTL pruning");
+}
+
 // Phase 5: Persistence check
 // ──────────────────────────────────────────────────────────────
 
