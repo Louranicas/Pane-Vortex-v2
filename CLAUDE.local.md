@@ -168,3 +168,37 @@ CARGO_TARGET_DIR=/tmp/cargo-pv2 cargo clippy -- -D warnings 2>&1 | tail -20 && \
 CARGO_TARGET_DIR=/tmp/cargo-pv2 cargo clippy -- -D warnings -W clippy::pedantic 2>&1 | tail -20 && \
 CARGO_TARGET_DIR=/tmp/cargo-pv2 cargo test --lib --release 2>&1 | tail -30
 ```
+
+
+---
+
+## Habitat Bootstrap Protocol (Fresh Context Window)
+
+**Execute these in order at the start of EVERY new context window:**
+
+| # | Command | What It Loads |
+|---|---------|---------------|
+| 1 | `/primehabitat` | Zellij tabs, 17 services, IPC bus, memory systems |
+| 2 | `/deephabitat` | Wire protocol, 173 DBs, devenv batches, 100+ binaries |
+| 3 | Read `CLAUDE.local.md` | Current session state, phase tracking, session history |
+
+**After bootstrap, WAIT for user instruction before taking action.**
+
+### Operational Commands (use as needed after bootstrap)
+
+| Command | When To Use |
+|---------|-------------|
+| `/gate` | Before every commit — 4-stage quality gate: check → clippy → pedantic → test |
+| `/sweep` | Health check — probe all 17 services + ORAC + thermal + field |
+| `/deploy-orac` | After ORAC code changes — build → deploy → verify (encodes all traps) |
+| `/forge` | After ANY service code changes — generic build → deploy → verify |
+| `/genesis` | Create new service from zero — scaffold + register + deploy |
+| `/integrate` | Wire service into Habitat — hooks + bridges + PV2 + RM + POVM |
+| `/acp` | Complex decisions — Adversarial Convergence Protocol (3 rounds) |
+| `/battern` | Multi-pane work — fleet batch dispatch with roles + gates |
+| `/nerve` | Live monitoring — continuous Nerve Center dashboard (10s refresh) |
+| `/propagate` | After adding commands — push command table to all service CLAUDE.md files |
+| `/nvim-mastery` | Neovim RPC: LSP, treesitter, 37 keymaps, 22 snacks features, structural analysis |
+| `/atuin-mastery` | Shell history intelligence: search, stats, service density, time-of-day, KV store |
+
+> Commands defined at `orac-sidecar/.claude/commands/` and workspace `.claude/skills/`. Work from ANY service directory.

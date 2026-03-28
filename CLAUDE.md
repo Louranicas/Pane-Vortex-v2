@@ -91,3 +91,50 @@ L1 has zero internal dependencies. Each layer only imports from lower layers.
 - **Master Plan:** `MASTERPLAN.md` in this directory
 - **Obsidian:** `[[The Habitat — Integrated Master Plan V3]]`
 - **Skills:** `.claude/skills/deephabitat/SKILL.md`
+
+> These commands work from ANY service directory. They are defined at `orac-sidecar/.claude/commands/`.
+
+| Command | What It Does |
+|---------|-------------|
+| `/gate` | 4-stage quality gate: check → clippy → pedantic → test |
+| `/sweep` | Probe 17 services + ORAC + thermal + field |
+| `/deploy-orac` | Build → deploy → verify (encodes all traps) |
+| `/acp` | Adversarial Convergence Protocol (3 rounds) |
+| `/battern` | Fleet batch dispatch: roles → gate → collect |
+| `/nerve` | Continuous Nerve Center dashboard (10s refresh) |
+
+
+> These commands work from ANY service directory. They are defined at `orac-sidecar/.claude/commands/`.
+
+| Command | What It Does |
+|---------|-------------|
+| `/gate` | 4-stage quality gate: check → clippy → pedantic → test |
+| `/sweep` | Probe 17 services + ORAC + thermal + field |
+| `/deploy-orac` | Build → deploy → verify (encodes all traps) |
+| `/acp` | Adversarial Convergence Protocol (3 rounds) |
+| `/battern` | Fleet batch dispatch: roles → gate → collect |
+| `/nerve` | Continuous Nerve Center dashboard (10s refresh) |
+| `/propagate` | Push command table to all service CLAUDE.md files |
+| `/nvim-mastery` | Neovim RPC: LSP, treesitter, 37 keymaps, 22 snacks features, structural analysis |
+| `/atuin-mastery` | Shell history intelligence: search, stats, service density, time-of-day, KV store |
+
+
+## Habitat Slash Commands (Session 065)
+
+> These commands work from ANY service directory. They are defined at `orac-sidecar/.claude/commands/` and workspace `.claude/skills/`.
+
+| Command | What It Does |
+|---------|-------------|
+| `/gate` | 4-stage quality gate: check → clippy → pedantic → test |
+| `/sweep` | Probe 17 services + ORAC + thermal + field |
+| `/deploy-orac` | Build → deploy → verify (encodes all traps) |
+| `/forge` | Generic build → deploy → verify for ANY Rust service |
+| `/genesis` | New service from zero to running (scaffold + register + deploy) |
+| `/integrate` | Wire service into Habitat (hooks + bridges + PV2 + RM + POVM) |
+| `/acp` | Adversarial Convergence Protocol (3 rounds) |
+| `/battern` | Fleet batch dispatch: roles → gate → collect |
+| `/nerve` | Continuous Nerve Center dashboard (10s refresh) |
+| `/propagate` | Push command table to all service CLAUDE.md files |
+| `/nvim-mastery` | Neovim RPC: LSP, treesitter, 37 keymaps, 22 snacks features, structural analysis |
+| `/atuin-mastery` | Shell history intelligence: search, stats, service density, time-of-day, KV store |
+
