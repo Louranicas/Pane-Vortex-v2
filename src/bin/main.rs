@@ -661,6 +661,7 @@ fn seed_bridge_ticks(
 // ──────────────────────────────────────────────────────────────
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() {
     init_tracing();
 
@@ -715,13 +716,33 @@ async fn main() {
         snap.clone(),
     );
 
-    // Spawn IPC bus listener
+    // Spawn IPC bus listener with restart wrapper (Session 071 #5).
+    // Previously fire-and-forget — if listener crashed, socket died silently
+    // while HTTP stayed healthy. Now retries with exponential backoff.
     {
         let listener_state = state.clone();
         let listener_bus = bus_state.clone();
         tokio::spawn(async move {
-            if let Err(e) = start_bus_listener(listener_state, listener_bus).await {
-                error!("IPC bus listener failed: {e}");
+            let mut attempt: u32 = 0;
+            loop {
+                attempt += 1;
+                info!(attempt, "IPC bus listener starting");
+                match start_bus_listener(listener_state.clone(), listener_bus.clone()).await {
+                    Ok(()) => {
+                        info!("IPC bus listener exited cleanly");
+                        break;
+                    }
+                    Err(e) => {
+                        let backoff = Duration::from_secs(2_u64.saturating_pow(attempt.min(5)));
+                        error!(
+                            attempt,
+                            backoff_secs = backoff.as_secs(),
+                            error = %e,
+                            "IPC bus listener failed — restarting"
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
             }
         });
     }

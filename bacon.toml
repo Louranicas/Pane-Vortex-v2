@@ -3,6 +3,7 @@
 # Uses /tmp target dir to avoid polluting project (standard PV pattern)
 
 default_job = "check"
+listen = true
 
 [jobs.check]
 command = ["cargo", "check"]

@@ -117,6 +117,7 @@ L1 has zero internal dependencies. Each layer only imports from lower layers.
 | `/propagate` | Push command table to all service CLAUDE.md files |
 | `/nvim-mastery` | Neovim RPC: LSP, treesitter, 37 keymaps, 22 snacks features, structural analysis |
 | `/atuin-mastery` | Shell history intelligence: search, stats, service density, time-of-day, KV store |
+| `/bacon-mastery` | Continuous Rust quality: on_success chaining, socket control, export locations, headless CI |
 
 
 ## Habitat Slash Commands (Session 065)
@@ -137,4 +138,5 @@ L1 has zero internal dependencies. Each layer only imports from lower layers.
 | `/propagate` | Push command table to all service CLAUDE.md files |
 | `/nvim-mastery` | Neovim RPC: LSP, treesitter, 37 keymaps, 22 snacks features, structural analysis |
 | `/atuin-mastery` | Shell history intelligence: search, stats, service density, time-of-day, KV store |
+| `/bacon-mastery` | Continuous Rust quality: on_success chaining, socket control, export locations, headless CI |
 

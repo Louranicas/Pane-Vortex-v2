@@ -200,5 +200,6 @@ CARGO_TARGET_DIR=/tmp/cargo-pv2 cargo test --lib --release 2>&1 | tail -30
 | `/propagate` | After adding commands — push command table to all service CLAUDE.md files |
 | `/nvim-mastery` | Neovim RPC: LSP, treesitter, 37 keymaps, 22 snacks features, structural analysis |
 | `/atuin-mastery` | Shell history intelligence: search, stats, service density, time-of-day, KV store |
+| `/bacon-mastery` | Continuous Rust quality: on_success chaining, socket control, export locations, headless CI |
 
 > Commands defined at `orac-sidecar/.claude/commands/` and workspace `.claude/skills/`. Work from ANY service directory.
