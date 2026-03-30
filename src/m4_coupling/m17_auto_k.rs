@@ -37,7 +37,7 @@ impl AutoKController {
         Self {
             ticks_since_recalc: 0,
             period: m04_constants::COUPLING_STEPS_PER_TICK as u64, // 15 ticks default
-            previous_k: 1.5,
+            previous_k: 1.0,
             smoothing: 0.3,
         }
     }
@@ -48,7 +48,7 @@ impl AutoKController {
         Self {
             ticks_since_recalc: 0,
             period,
-            previous_k: 1.5,
+            previous_k: 1.0,
             smoothing,
         }
     }
@@ -90,7 +90,7 @@ impl AutoKController {
     /// Reset the controller state.
     pub fn reset(&mut self) {
         self.ticks_since_recalc = 0;
-        self.previous_k = 1.5;
+        self.previous_k = 1.0;
     }
 
     /// Ticks until next recalculation.
@@ -146,7 +146,7 @@ mod tests {
     fn new_controller_default() {
         let ctrl = AutoKController::new();
         assert_eq!(ctrl.ticks_since_recalc, 0);
-        assert_relative_eq!(ctrl.previous_k, 1.5);
+        assert_relative_eq!(ctrl.previous_k, 1.0);
     }
 
     #[test]
@@ -240,7 +240,7 @@ mod tests {
         net.register(pid("b"), 1.0, 5.0);
         ctrl.tick(&mut net);
         // With full smoothing, K should stay at previous (1.5)
-        assert_relative_eq!(net.k, 1.5, epsilon = 1e-10);
+        assert_relative_eq!(net.k, 1.0, epsilon = 1e-10);
     }
 
     // ── Force recalc ──
@@ -262,7 +262,7 @@ mod tests {
         net.register(pid("a"), 0.0, 0.1);
         net.register(pid("b"), 1.0, 5.0);
         ctrl.force_recalc(&mut net);
-        assert!(net.k != 1.5 || net.frequencies.len() < 2);
+        assert!(net.k != 1.0 || net.frequencies.len() < 2);
     }
 
     // ── Reset ──
@@ -276,7 +276,7 @@ mod tests {
         }
         ctrl.reset();
         assert_eq!(ctrl.ticks_since_recalc, 0);
-        assert_relative_eq!(ctrl.previous_k, 1.5);
+        assert_relative_eq!(ctrl.previous_k, 1.0);
     }
 
     // ── Ticks remaining ──

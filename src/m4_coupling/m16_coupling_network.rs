@@ -80,7 +80,9 @@ impl CouplingNetwork {
             phases: HashMap::new(),
             frequencies: HashMap::new(),
             connections: Vec::new(),
-            k: 1.5,
+            // Session 072: Lowered from 1.5 to 1.0 to break convergence trap.
+            // K=1.5 is supercritical for N<10 spheres → r locks at 1.0 → STDP starves.
+            k: 1.0,
             auto_k: true,
             k_modulation: default_k_modulation(),
             asymmetric_hebbian: false,
@@ -207,7 +209,7 @@ impl CouplingNetwork {
     pub fn auto_scale_k(&mut self) {
         let n = self.frequencies.len();
         if n < 2 {
-            self.k = 1.5;
+            self.k = 1.0;
             return;
         }
 
@@ -228,12 +230,15 @@ impl CouplingNetwork {
         };
 
         let new_k = if spread < 1e-6 {
-            1.5
+            1.0
         } else {
             #[allow(clippy::cast_precision_loss)]
             let n_f = n as f64;
             let kc = (2.0 * spread / PI) * n_f;
-            kc.min(n_f)
+            // Session 072: Cap at 1.5 instead of N to prevent supercritical regime.
+            // With N=15 spheres, old cap was 15.0 (massively supercritical).
+            // K=1.5 allows coherence without phase-locking.
+            kc.min(1.5_f64)
         };
 
         // Rate limiter: K can change at most 25% per recalculation
@@ -424,9 +429,9 @@ mod tests {
     }
 
     #[test]
-    fn new_network_k_is_1_5() {
+    fn new_network_k_is_default() {
         let net = CouplingNetwork::new();
-        assert_relative_eq!(net.k, 1.5);
+        assert_relative_eq!(net.k, 1.0);
     }
 
     #[test]
@@ -573,7 +578,7 @@ mod tests {
     fn auto_k_single_sphere_default() {
         let mut net = CouplingNetwork::new();
         net.register(pid("a"), 0.0, 0.1);
-        assert_relative_eq!(net.k, 1.5);
+        assert_relative_eq!(net.k, 1.0);
     }
 
     #[test]
@@ -587,9 +592,9 @@ mod tests {
         net.frequencies.insert(pid("b"), 5.0);
         net.auto_k = true;
         // With only 2 spheres, uses median-adjacent spread (not IQR)
-        // Rate limiter caps at 25% change from initial k=1.5
+        // Rate limiter caps at 25% change from initial k=1.0
         net.auto_scale_k();
-        assert!(net.k >= 1.5, "K should not decrease with large spread, got {}", net.k);
+        assert!(net.k >= 1.0, "K should not decrease with large spread, got {}", net.k);
     }
 
     #[test]
@@ -616,15 +621,15 @@ mod tests {
     fn auto_k_rate_limited() {
         let mut net = CouplingNetwork::new();
         net.auto_k = false;
-        // Start with k=1.5, then create conditions that want k=100
+        // Start with k=1.0, then create conditions that want k=100
         net.phases.insert(pid("a"), 0.0);
         net.phases.insert(pid("b"), 0.0);
         net.frequencies.insert(pid("a"), 0.1);
         net.frequencies.insert(pid("b"), 100.0);
         net.auto_k = true;
         net.auto_scale_k();
-        // Rate limit: max change is 25% of 1.5 = 0.375
-        assert!(net.k <= 1.875 + 0.01, "rate limiter should cap K change: K={}", net.k);
+        // Rate limit: max change is 25% of 1.0 = 0.25
+        assert!(net.k <= 1.25 + 0.01, "rate limiter should cap K change: K={}", net.k);
     }
 
     #[test]
