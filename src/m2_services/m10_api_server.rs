@@ -249,7 +249,7 @@ fn parse_status(s: &str) -> Result<PaneStatus, PvError> {
 
 /// GET /health -- Basic health check (V1-compatible fields).
 async fn health_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
-    let (r, sphere_count, tick, fleet_mode, warmup) = {
+    let (r, sphere_count, tick, fleet_mode, warmup, potentiation_count, depression_count) = {
         let guard = ctx.state.read();
         // Use cached field state (computed every tick) for accurate r.
         // Falls back to r_history for backward compat during warmup.
@@ -260,7 +260,8 @@ async fn health_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
                 || guard.r_history.back().copied().unwrap_or(0.0),
                 |fs| fs.order_parameter.r,
             );
-        (r, guard.spheres.len(), guard.tick, guard.fleet_mode(), guard.warmup_remaining)
+        (r, guard.spheres.len(), guard.tick, guard.fleet_mode(), guard.warmup_remaining,
+         guard.hebbian_ltp_total, guard.hebbian_ltd_total)
     };
 
     let (k, k_mod) = {
@@ -277,6 +278,8 @@ async fn health_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
         "k": k,
         "k_modulation": k_mod,
         "warmup_remaining": warmup,
+        "hebbian_ltp_total": potentiation_count,
+        "hebbian_ltd_total": depression_count,
     }))
 }
 
@@ -297,6 +300,8 @@ async fn spheres_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
                     "memories": s.memories.len(),
                     "receptivity": s.receptivity,
                     "total_steps": s.total_steps,
+                    "activity_30s": s.activity_30s,
+                    "has_worked": s.has_worked,
                 })
             })
             .collect()
@@ -740,7 +745,7 @@ async fn status_handler(
 
     let pid = PaneId::new(&pane_id);
 
-    {
+    let heartbeat = {
         let mut guard = ctx.state.write();
         let sphere = guard
             .spheres
@@ -751,12 +756,15 @@ async fn status_handler(
             sphere.last_tool.clone_from(tool);
         }
         sphere.touch_heartbeat();
+        let hb = sphere.last_heartbeat;
         guard.state_changes += 1;
+        hb
     };
 
     Ok(Json(serde_json::json!({
         "pane_id": pane_id,
         "status": body.status,
+        "last_heartbeat": heartbeat,
     })))
 }
 
@@ -768,18 +776,20 @@ async fn heartbeat_handler(
     validate_pane_id(&pane_id)?;
     let pid = PaneId::new(&pane_id);
 
-    {
+    let heartbeat = {
         let mut guard = ctx.state.write();
         let sphere = guard
             .spheres
             .get_mut(&pid)
             .ok_or_else(|| PvError::SphereNotFound(pane_id.clone()))?;
         sphere.touch_heartbeat();
+        sphere.last_heartbeat
     };
 
     Ok(Json(serde_json::json!({
         "pane_id": pane_id,
         "heartbeat": "ok",
+        "last_heartbeat": heartbeat,
     })))
 }
 

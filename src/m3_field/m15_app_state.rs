@@ -122,6 +122,14 @@ pub struct AppState {
     /// Dynamic `k_mod_budget_max` override from governance proposals (GAP-2).
     #[serde(default)]
     pub k_mod_budget_max_override: Option<f64>,
+
+    // ── Hebbian STDP counters (Session 075 BREAK-5) ──
+    /// Cumulative LTP (long-term potentiation) events.
+    #[serde(default)]
+    pub hebbian_ltp_total: u64,
+    /// Cumulative LTD (long-term depression) events.
+    #[serde(default)]
+    pub hebbian_ltd_total: u64,
 }
 
 impl AppState {
@@ -156,6 +164,8 @@ impl AppState {
             proposal_manager: crate::m8_governance::m37_proposals::ProposalManager::new(),
             r_target_override: None,
             k_mod_budget_max_override: None,
+            hebbian_ltp_total: 0,
+            hebbian_ltd_total: 0,
         }
     }
 

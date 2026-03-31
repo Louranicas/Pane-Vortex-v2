@@ -118,7 +118,9 @@ pub fn tick_orchestrator(
     timings.coupling_ms = p2_start.elapsed().as_secs_f64() * 1000.0;
 
     // ── Phase 2.5: Hebbian STDP learning (BUG-031 fix) ──
-    tick_hebbian(state, network);
+    let stdp_result = tick_hebbian(state, network);
+    state.hebbian_ltp_total = state.hebbian_ltp_total.saturating_add(stdp_result.ltp_count as u64);
+    state.hebbian_ltd_total = state.hebbian_ltd_total.saturating_add(stdp_result.ltd_count as u64);
 
     // ── Phase 2.7: Bridge k_mod application ──
     let bridge_start = Instant::now();
@@ -199,8 +201,31 @@ pub fn tick_orchestrator(
 
 /// Update all sphere internal state (memory decay, activation, buoy drift).
 fn tick_sphere_steps(state: &mut AppState) {
+    let current_tick = state.tick;
     for sphere in state.spheres.values_mut() {
         sphere.step();
+    }
+
+    // Session 075: Activity counter decay — V1→V2 regression fix.
+    // V1 halved activity counters at their respective intervals:
+    //   activity_30s every 6 ticks (~30s), activity_5m every 60 ticks (~5m),
+    //   activity_30m every 360 ticks (~30m).
+    // V2 scaffold lost this, causing counters to accumulate unbounded
+    // and burst detection to fire permanently after 4 tool uses.
+    if current_tick % 6 == 0 {
+        for sphere in state.spheres.values_mut() {
+            sphere.activity_30s /= 2;
+        }
+    }
+    if current_tick % 60 == 0 {
+        for sphere in state.spheres.values_mut() {
+            sphere.activity_5m /= 2;
+        }
+    }
+    if current_tick % 360 == 0 {
+        for sphere in state.spheres.values_mut() {
+            sphere.activity_30m /= 2;
+        }
     }
 }
 
@@ -256,16 +281,19 @@ fn tick_coupling(state: &mut AppState, network: &mut CouplingNetwork) {
 ///
 /// Co-active spheres (both Working) get LTP (+0.01, with burst/newcomer multipliers).
 /// Non-co-active pairs get LTD (-0.002). Weight floor enforced at 0.15.
-fn tick_hebbian(state: &AppState, network: &mut CouplingNetwork) {
+/// Apply Hebbian STDP and return result for counter accumulation.
+fn tick_hebbian(state: &AppState, network: &mut CouplingNetwork) -> crate::m5_learning::m19_hebbian_stdp::StdpResult {
     if state.spheres.len() < 2 {
-        return;
+        return crate::m5_learning::m19_hebbian_stdp::StdpResult::default();
     }
-    let _result = crate::m5_learning::m19_hebbian_stdp::apply_stdp(network, &state.spheres);
+    let result = crate::m5_learning::m19_hebbian_stdp::apply_stdp(network, &state.spheres);
 
     // Session 073 BUG-073-C/F fix: Gentle weight decay every tick to prevent
     // ceiling saturation. 0.998 was too aggressive — drove 24/30 weights to floor.
     // Factor 0.9995 = 0.05% decay per tick, allowing STDP weight differentiation.
     crate::m5_learning::m19_hebbian_stdp::decay_all_weights(network, 0.9995);
+
+    result
 }
 
 // ──────────────────────────────────────────────────────────────

@@ -22,9 +22,11 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use pane_vortex::m1_foundation::{
+    m01_core_types::PaneId,
     m03_config::PvConfig,
     m04_constants,
 };
+use pane_vortex::m3_field::m11_sphere::PaneSphere;
 use pane_vortex::m3_field::m15_app_state::{new_shared_state, SharedState};
 use pane_vortex::m4_coupling::m16_coupling_network::CouplingNetwork;
 use pane_vortex::m7_coordination::m29_ipc_bus::{start_bus_listener, BusState};
@@ -657,6 +659,55 @@ fn seed_bridge_ticks(
 }
 
 // ──────────────────────────────────────────────────────────────
+// Diversity seeding
+// ──────────────────────────────────────────────────────────────
+
+/// Seed 3 diverse-frequency spheres if the field has fewer than 3.
+///
+/// Without frequency diversity, `auto_scale_k` falls back to K=1.5 (supercritical),
+/// and all coupling weights converge to identical values (Session 073 convergence trap).
+/// These seed spheres provide the frequency spread needed for healthy Kuramoto dynamics.
+fn seed_diversity(
+    state: &SharedState,
+    network: &Arc<RwLock<CouplingNetwork>>,
+) {
+    const SEEDS: [(&str, &str, f64); 3] = [
+        ("seed-diversity-1", "diversity-low",  0.18),
+        ("seed-diversity-2", "diversity-mid",  0.26),
+        ("seed-diversity-3", "diversity-high", 0.34),
+    ];
+
+    let count = state.read().spheres.len();
+    if count >= 3 {
+        info!(count, "field has >= 3 spheres — diversity seeding skipped");
+        return;
+    }
+
+    let mut seeded = 0u32;
+    for &(id, persona, freq) in &SEEDS {
+        let pid = PaneId::new(id);
+        if state.read().spheres.contains_key(&pid) {
+            continue;
+        }
+        let Ok(sphere) = PaneSphere::new(pid.clone(), persona.into(), freq) else {
+            warn!(id, "diversity seed sphere creation failed");
+            continue;
+        };
+        let phase = sphere.phase;
+        {
+            let mut guard = state.write();
+            guard.spheres.insert(pid.clone(), sphere);
+            guard.state_changes += 1;
+        }
+        network.write().register(pid, phase, freq);
+        seeded += 1;
+    }
+    if seeded > 0 {
+        info!(seeded, "diversity seed spheres registered (0.18 / 0.26 / 0.34 Hz)");
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
 // Main
 // ──────────────────────────────────────────────────────────────
 
@@ -689,6 +740,9 @@ async fn main() {
 
     // Create coupling network and reconcile with restored spheres
     let network = Arc::new(RwLock::new(reconcile_coupling(&state)));
+
+    // Seed diverse-frequency spheres if field has fewer than 3
+    seed_diversity(&state, &network);
 
     // Create conductor
     let conductor = Arc::new(Conductor::new());

@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use crate::m1_foundation::m01_core_types::{now_secs, PaneId};
+use crate::m1_foundation::m01_core_types::PaneId;
 
 // ──────────────────────────────────────────────────────────────
 // Types
@@ -120,7 +120,7 @@ const DEFAULT_MAX_OBSERVATIONS: usize = 500;
 impl EvolutionChamber {
     /// Create a new evolution chamber.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             patterns: Vec::new(),
             events: VecDeque::new(),
@@ -209,6 +209,7 @@ pub struct EvolutionSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::m1_foundation::m01_core_types::now_secs;
 
     fn pid(s: &str) -> PaneId {
         PaneId::new(s)
