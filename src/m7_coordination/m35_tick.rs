@@ -164,6 +164,14 @@ pub fn tick_orchestrator(
         tick_prune_idle_spheres(state, network, current_tick);
     }
 
+    // ── Phase 4.6: Ghost sweep (Session 070) ──
+    // Every 120 ticks (~10 min), deregister spheres whose last heartbeat exceeds
+    // GHOST_DEREGISTER_SECS (900s). Uses the same collect-then-remove pattern as
+    // Phase 4.5 to avoid mid-iteration mutation.
+    if current_tick % 120 == 0 && current_tick > 0 {
+        tick_sweep_ghosts(state, network);
+    }
+
     // ── Phase 5: Persistence check ──
     let p5_start = Instant::now();
     let should_snapshot = tick_persistence_check(state, current_tick);
@@ -253,6 +261,11 @@ fn tick_hebbian(state: &AppState, network: &mut CouplingNetwork) {
         return;
     }
     let _result = crate::m5_learning::m19_hebbian_stdp::apply_stdp(network, &state.spheres);
+
+    // Session 073 BUG-073-C/F fix: Gentle weight decay every tick to prevent
+    // ceiling saturation. 0.998 was too aggressive — drove 24/30 weights to floor.
+    // Factor 0.9995 = 0.05% decay per tick, allowing STDP weight differentiation.
+    crate::m5_learning::m19_hebbian_stdp::decay_all_weights(network, 0.9995);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -441,6 +454,61 @@ fn tick_prune_idle_spheres(
         network.deregister(id);
     }
     tracing::info!(pruned = count, tick, "Idle sphere TTL pruning");
+}
+
+// Phase 4.6: Ghost sweep (Session 070)
+// ──────────────────────────────────────────────────────────────
+
+/// Deregister spheres whose last heartbeat exceeds `GHOST_DEREGISTER_SECS`.
+///
+/// Heartbeats are updated by API handlers (`touch_heartbeat()`) whenever a
+/// sphere interacts with PV2. Spheres from dead processes stop heartbeating
+/// and accumulate indefinitely without this sweep. Uses the same collect-
+/// then-remove pattern as [`tick_prune_idle_spheres`] for safety.
+///
+/// Runs every 120 ticks (~10 minutes at 5s/tick) from the tick orchestrator.
+fn tick_sweep_ghosts(
+    state: &mut AppState,
+    network: &mut CouplingNetwork,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    let to_deregister: Vec<PaneId> = state
+        .spheres
+        .iter()
+        .filter_map(|(id, sphere)| {
+            let silence = now - sphere.last_heartbeat;
+            // Guard: skip spheres with heartbeat=0 (never set, e.g. just registered)
+            // or negative silence (clock drift). Session 073 BUG-073-F fix:
+            // removed 86400s upper bound that was exempting long-silent spheres.
+            if sphere.last_heartbeat < 1.0 || silence < 0.0 {
+                return None;
+            }
+            if silence > m04_constants::GHOST_DEREGISTER_SECS {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if to_deregister.is_empty() {
+        return;
+    }
+
+    let count = to_deregister.len();
+    for id in &to_deregister {
+        state.spheres.remove(id);
+        network.deregister(id);
+    }
+    tracing::info!(
+        swept = count,
+        threshold_secs = m04_constants::GHOST_DEREGISTER_SECS,
+        "Ghost sweep: deregistered stale spheres"
+    );
 }
 
 // Phase 5: Persistence check
