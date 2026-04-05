@@ -111,9 +111,15 @@ pub enum VoteChoice {
 pub struct ProposalManager {
     /// Active and archived proposals.
     proposals: HashMap<String, Proposal>,
-    /// Maximum active proposals.
+    /// Maximum active (open) proposals.
     #[serde(default = "default_max_active")]
     max_active: usize,
+    /// Maximum total proposals retained (open + resolved).
+    ///
+    /// When this cap is exceeded, the oldest resolved (non-open) proposals
+    /// are pruned to prevent unbounded memory growth.
+    #[serde(default = "default_max_total")]
+    max_total: usize,
     /// Voting window in ticks.
     #[serde(default = "default_voting_window")]
     voting_window: u64,
@@ -125,6 +131,13 @@ pub struct ProposalManager {
 /// BUG-032 fix: serde default for `max_active` (was 0 via `derive(Default)`).
 const fn default_max_active() -> usize {
     100
+}
+
+/// Total proposal history cap — prevents unbounded map growth.
+///
+/// When the total exceeds this, the oldest resolved proposals are evicted.
+const fn default_max_total() -> usize {
+    500
 }
 
 /// BUG-032 fix: serde default for `voting_window`.
@@ -154,6 +167,7 @@ impl ProposalManager {
         Self {
             proposals: HashMap::new(),
             max_active: m04_constants::DECISION_HISTORY_MAX, // 100
+            max_total: default_max_total(),
             voting_window: 200,
             quorum_threshold: 0.5,
         }
@@ -166,6 +180,9 @@ impl ProposalManager {
     pub fn reconcile(&mut self) {
         if self.max_active == 0 {
             self.max_active = default_max_active();
+        }
+        if self.max_total == 0 {
+            self.max_total = default_max_total();
         }
         if self.voting_window == 0 {
             self.voting_window = default_voting_window();
@@ -181,8 +198,66 @@ impl ProposalManager {
         Self {
             proposals: HashMap::new(),
             max_active,
+            max_total: default_max_total(),
             voting_window,
             quorum_threshold,
+        }
+    }
+
+    /// Create with full custom config including `max_total`.
+    ///
+    /// Intended primarily for testing; production code should use [`Self::with_config`].
+    #[must_use]
+    pub fn with_full_config(
+        max_active: usize,
+        max_total: usize,
+        voting_window: u64,
+        quorum_threshold: f64,
+    ) -> Self {
+        Self {
+            proposals: HashMap::new(),
+            max_active,
+            max_total,
+            voting_window,
+            quorum_threshold,
+        }
+    }
+
+    /// Prune the oldest resolved (non-open) proposals when `max_total` is exceeded.
+    ///
+    /// Applied proposals are pruned first, then expired, then rejected.
+    /// Open proposals are never pruned.
+    fn prune_if_needed(&mut self) {
+        if self.proposals.len() <= self.max_total {
+            return;
+        }
+
+        // Priority order for eviction: Applied → Expired → Rejected
+        let eviction_priority = [
+            ProposalStatus::Applied,
+            ProposalStatus::Expired,
+            ProposalStatus::Rejected,
+        ];
+
+        for status in eviction_priority {
+            if self.proposals.len() <= self.max_total {
+                break;
+            }
+            // Collect candidates by submitted_at_tick (oldest first)
+            let mut candidates: Vec<(String, u64)> = self
+                .proposals
+                .iter()
+                .filter(|(_, p)| p.status == status)
+                .map(|(id, p)| (id.clone(), p.submitted_at_tick))
+                .collect();
+            candidates.sort_by_key(|(_, tick)| *tick);
+
+            for (id, _) in candidates {
+                if self.proposals.len() <= self.max_total {
+                    break;
+                }
+                self.proposals.remove(&id);
+            }
         }
     }
 
@@ -288,6 +363,9 @@ impl ProposalManager {
                 }
             }
         }
+
+        // Prune resolved proposals to prevent unbounded history growth.
+        self.prune_if_needed();
     }
 
     /// Get a proposal by ID.
@@ -320,6 +398,12 @@ impl ProposalManager {
             .collect()
     }
 
+    /// Return the configured `max_total` history cap.
+    #[must_use]
+    pub const fn max_total(&self) -> usize {
+        self.max_total
+    }
+
     /// Mark a proposal as applied.
     pub fn mark_applied(&mut self, id: &str) {
         if let Some(p) = self.proposals.get_mut(id) {
@@ -327,6 +411,8 @@ impl ProposalManager {
                 p.status = ProposalStatus::Applied;
             }
         }
+        // After marking as applied the total may exceed the cap — prune.
+        self.prune_if_needed();
     }
 }
 
@@ -737,5 +823,57 @@ mod tests {
     #[test]
     fn proposal_status_default() {
         assert_eq!(ProposalStatus::default(), ProposalStatus::Open);
+    }
+
+    // ── History pruning ──
+
+    #[test]
+    fn prune_does_not_remove_open_proposals() {
+        // max_total = 3, max_active = 10; create 3 open proposals — none pruned.
+        let mut mgr = ProposalManager::with_full_config(10, 3, 5, 0.5);
+        mgr.submit(pid("a"), ProposableParameter::RTarget, 0.85, 0.93, "1".into(), 1).unwrap();
+        mgr.submit(pid("b"), ProposableParameter::RTarget, 0.80, 0.93, "2".into(), 2).unwrap();
+        mgr.submit(pid("c"), ProposableParameter::RTarget, 0.75, 0.93, "3".into(), 3).unwrap();
+        // Prune would only remove resolved; all are open → none removed.
+        mgr.prune_if_needed();
+        assert_eq!(mgr.all().len(), 3, "open proposals must not be pruned");
+    }
+
+    #[test]
+    fn prune_removes_oldest_expired_first() {
+        // max_total=2, max_active=10; submit 3 proposals, expire all, then process.
+        let mut mgr = ProposalManager::with_full_config(10, 2, 5, 0.5);
+        let id1 = mgr.submit(pid("a"), ProposableParameter::RTarget, 0.85, 0.93, "1".into(), 1).unwrap();
+        let _id2 = mgr.submit(pid("b"), ProposableParameter::RTarget, 0.80, 0.93, "2".into(), 2).unwrap();
+        let id3 = mgr.submit(pid("c"), ProposableParameter::RTarget, 0.75, 0.93, "3".into(), 3).unwrap();
+        // active_sphere_count=0 → all expire (no quorum possible)
+        mgr.process(20, 0);
+        // max_total=2 → at most 2 proposals remain
+        assert!(mgr.all().len() <= 2, "should have pruned to at most max_total");
+        // id3 (submitted at tick 3 — newest) must still be present
+        assert!(mgr.get(&id3).is_some(), "newest proposal must survive pruning");
+        // id1 (submitted at tick 1 — oldest) must be pruned first
+        assert!(mgr.get(&id1).is_none(), "oldest proposal must be pruned first");
+    }
+
+    #[test]
+    fn prune_open_proposals_survive_even_when_cap_exceeded() {
+        // max_total=1, max_active=5; submit 3 open proposals — all survive because
+        // prune only targets resolved proposals.
+        let mut mgr = ProposalManager::with_full_config(5, 1, 500, 0.5);
+        mgr.submit(pid("a"), ProposableParameter::RTarget, 0.85, 0.93, "1".into(), 1).unwrap();
+        mgr.submit(pid("b"), ProposableParameter::RTarget, 0.80, 0.93, "2".into(), 2).unwrap();
+        mgr.submit(pid("c"), ProposableParameter::RTarget, 0.75, 0.93, "3".into(), 3).unwrap();
+        mgr.prune_if_needed();
+        // All 3 still present — none are resolved so nothing can be evicted.
+        assert_eq!(mgr.all().len(), 3, "open proposals cannot be pruned");
+    }
+
+    #[test]
+    fn reconcile_sets_max_total_default() {
+        let mut mgr = ProposalManager::with_full_config(10, 0, 100, 0.5);
+        // max_total=0 is treated as misconfigured; reconcile resets it.
+        mgr.reconcile();
+        assert_eq!(mgr.max_total(), default_max_total());
     }
 }

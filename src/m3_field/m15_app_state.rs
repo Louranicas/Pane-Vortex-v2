@@ -252,6 +252,7 @@ impl AppState {
         self.warmup_remaining = m04_constants::WARMUP_TICKS;
 
         // BUG-032 fix: ensure ProposalManager has valid config after restore.
+        #[cfg(feature = "governance")]
         self.proposal_manager.reconcile();
     }
 

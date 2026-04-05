@@ -840,7 +840,7 @@ async fn handle_connection(
             "peer_count": peer_count,
             "r": 0.0,
             "protocol_version": 1
-        })).unwrap_or_default()
+        })).map_err(|e| PvError::BusProtocol(format!("failed to serialize V1 welcome: {e}")))?
     } else {
         // V2 format
         let welcome = BusFrame::Welcome {
@@ -1065,7 +1065,7 @@ async fn handle_frame(
                     "type": "subscribed",
                     "count": count,
                 }))
-                .unwrap_or_default();
+                .map_err(|e| PvError::BusProtocol(format!("failed to serialize V1 subscribed: {e}")))?;
                 tx.send(line).await.map_err(|e| {
                     PvError::BusSocket(format!("v1 send failed: {e}"))
                 })?;
@@ -1127,7 +1127,7 @@ async fn handle_frame(
                     "type": "task_submitted",
                     "task_id": task_id.as_str(),
                 }))
-                .unwrap_or_default();
+                .map_err(|e| PvError::BusProtocol(format!("failed to serialize V1 task_submitted: {e}")))?;
                 tx.send(line).await.map_err(|e| {
                     PvError::BusSocket(format!("v1 send failed: {e}"))
                 })?;
@@ -1164,7 +1164,7 @@ async fn handle_frame(
                     "target": target.as_str(),
                     "accepted": true,
                 }))
-                .unwrap_or_default();
+                .map_err(|e| PvError::BusProtocol(format!("failed to serialize V1 cascade_ack: {e}")))?;
                 tx.send(line).await.map_err(|e| {
                     PvError::BusSocket(format!("v1 send failed: {e}"))
                 })?;

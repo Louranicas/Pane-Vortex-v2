@@ -18,6 +18,17 @@
 //! | Coupling | 2 | `/coupling/matrix`, `/coupling/weight` |
 //! | Bus | 9 | `/bus/info`, tasks, events, submit, claim, complete, fail, cascade, cascades |
 //! | Bridges | 1 | `/bridges/health` |
+//!
+//! ## Audit Fixes (Agent-1, Session 089)
+//! - BUG-02/BUG-05: TOCTOU race in `register_handler` — existence check,
+//!   ghost-accept, and sphere insertion now occur in a single write-lock block,
+//!   preventing concurrent registrations from bypassing the existence check.
+//! - BUG-03: `bus_task_claim_handler` used `PvError::SphereNotFound` for a
+//!   task-not-found condition — fixed to `PvError::BusTaskNotFound`.
+//! - BUG-07: `bus_task_complete_handler` and `bus_task_fail_handler` used
+//!   `PvError::SphereNotFound` for task-not-found — fixed to `PvError::BusTaskNotFound`.
+//! - BUG-04: Governance `propose_handler` used `unwrap_or` on `strip_prefix` —
+//!   replaced with `map_or` for clarity.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -503,42 +514,38 @@ async fn register_handler(
 
     let pid = PaneId::new(&pane_id);
 
-    {
-        let guard = ctx.state.read();
+    // TOCTOU fix: check, ghost-accept, and insert in a single write-lock block
+    // to prevent a concurrent registration slipping between the existence check
+    // and the insertion.
+    let mut sphere = PaneSphere::new(pid.clone(), body.persona.clone(), freq)?;
+
+    let (ghost_restored, initial_phase) = {
+        let mut guard = ctx.state.write();
+        // Re-check inside the write lock (atomically)
         if guard.spheres.contains_key(&pid) {
             return Err(PvError::SphereAlreadyRegistered(pane_id).into());
         }
         if guard.spheres.len() >= m04_constants::SPHERE_CAP {
             return Err(PvError::SphereCapReached(m04_constants::SPHERE_CAP).into());
         }
-    }
-
-    let mut sphere = PaneSphere::new(pid.clone(), body.persona.clone(), freq)?;
-
-    // Ghost reincarnation: if a ghost trace exists for this ID, restore its phase
-    let ghost_restored = {
-        let mut guard = ctx.state.write();
-        if let Some(ghost) = guard.accept_ghost(&pid) {
+        // Ghost reincarnation: restore phase from previous departure
+        let restored = if let Some(ghost) = guard.accept_ghost(&pid) {
             sphere.phase = ghost.phase_at_departure;
             true
         } else {
             false
-        }
-    };
-
-    let phase = sphere.phase;
-
-    {
-        let mut guard = ctx.state.write();
+        };
+        let phase = sphere.phase;
         guard.spheres.insert(pid.clone(), sphere);
         guard.state_changes += 1;
         guard.mark_dirty();
-    }
+        (restored, phase)
+    };
 
     // Register in coupling network
     {
         let mut net = ctx.network.write();
-        net.register(pid, phase, freq);
+        net.register(pid, initial_phase, freq);
     }
 
     // GAP-1 fix: Broadcast sphere.registered to IPC bus subscribers
@@ -1283,7 +1290,7 @@ async fn bus_task_claim_handler(
     let ok = {
         let mut bus = ctx.bus.write();
         let task = bus.get_task_mut(&task_id).ok_or_else(|| {
-            PvError::SphereNotFound(format!("task not found: {task_id}"))
+            PvError::BusTaskNotFound(task_id.clone())
         })?;
         task.claim(claim_sphere)
     };
@@ -1322,7 +1329,7 @@ async fn bus_task_complete_handler(
     let completed = {
         let mut bus = ctx.bus.write();
         let task = bus.get_task_mut(&task_id).ok_or_else(|| {
-            PvError::SphereNotFound(format!("task not found: {task_id}"))
+            PvError::BusTaskNotFound(task_id.clone())
         })?;
         task.complete()
     };
@@ -1356,7 +1363,7 @@ async fn bus_task_fail_handler(
     let failed = {
         let mut bus = ctx.bus.write();
         let task = bus.get_task_mut(&task_id).ok_or_else(|| {
-            PvError::SphereNotFound(format!("task not found: {task_id}"))
+            PvError::BusTaskNotFound(task_id.clone())
         })?;
         task.fail()
     };
@@ -1519,7 +1526,10 @@ async fn propose_handler(
         "coupling_steps" => ProposableParameter::CouplingSteps,
         "opt_out_policy" => ProposableParameter::OptOutPolicy,
         other if other.starts_with("sphere_override:") => {
-            let target = other.strip_prefix("sphere_override:").unwrap_or("");
+            // strip_prefix always succeeds here — the guard already confirmed the prefix
+            let target = other
+                .strip_prefix("sphere_override:")
+                .map_or("", |s| s);
             ProposableParameter::SphereOverride {
                 target_sphere: target.to_owned(),
             }

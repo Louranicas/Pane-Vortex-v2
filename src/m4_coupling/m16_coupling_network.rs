@@ -241,8 +241,9 @@ impl CouplingNetwork {
             kc.min(1.5_f64)
         };
 
-        // Rate limiter: K can change at most 25% per recalculation
-        let max_change = self.k * 0.25;
+        // Rate limiter: K can change at most 25% per recalculation.
+        // Use max(0.01) so a K of 0.0 doesn't trap the limiter at zero forever.
+        let max_change = self.k.max(0.01) * 0.25;
         self.k = new_k.clamp(self.k - max_change, self.k + max_change);
     }
 
@@ -277,7 +278,9 @@ impl CouplingNetwork {
 
         for (id, phase) in &mut self.phases {
             let freq = self.frequencies.get(id).copied().unwrap_or(0.0);
-            let old_phase = old_phases[id];
+            // old_phases is cloned from self.phases above; get() avoids the HashMap
+            // index operator which panics on a missing key.
+            let old_phase = old_phases.get(id).copied().unwrap_or(0.0);
 
             // Sum coupling contributions via adjacency index
             let coupling_sum: f64 = self

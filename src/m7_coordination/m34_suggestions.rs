@@ -6,7 +6,7 @@
 //! ## Layer: L7 | Module: M34 | Dependencies: L1, L3 (M11, M12)
 //! ## NA: NA-P-16 (sphere-invokable, not auto-invoked)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use crate::m1_foundation::m01_core_types::{FieldAction, PaneId};
@@ -124,8 +124,8 @@ impl fmt::Display for FieldSuggestion {
 /// on the bus for spheres to optionally act upon.
 #[derive(Debug)]
 pub struct SuggestionEngine {
-    /// Recent suggestions (ring buffer).
-    recent: Vec<FieldSuggestion>,
+    /// Recent suggestions (bounded ring buffer — O(1) push and eviction via `VecDeque`).
+    recent: VecDeque<FieldSuggestion>,
     /// Maximum recent suggestions to retain.
     max_recent: usize,
 }
@@ -135,7 +135,7 @@ impl SuggestionEngine {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            recent: Vec::new(),
+            recent: VecDeque::new(),
             max_recent: 200,
         }
     }
@@ -177,12 +177,12 @@ impl SuggestionEngine {
             .take(MAX_SUGGESTIONS_PER_TICK)
             .collect();
 
-        // Store in recent buffer
+        // Store in recent buffer — push_back + pop_front is O(1) on VecDeque
         for s in &filtered {
-            self.recent.push(s.clone());
-        }
-        while self.recent.len() > self.max_recent {
-            self.recent.remove(0);
+            if self.recent.len() >= self.max_recent {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(s.clone());
         }
 
         filtered

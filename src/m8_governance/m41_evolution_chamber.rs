@@ -147,12 +147,35 @@ impl EvolutionChamber {
     }
 
     /// Add or update a pattern.
+    ///
+    /// Confidence is normalised to [0.0, 1.0] on every write to guard against
+    /// NaN, infinity, and out-of-range values propagating into stored state.
+    /// Non-finite values are replaced with 0.0 before clamping.
+    ///
+    /// The observation count is managed internally starting at 1 on first
+    /// insert; the `observation_count` field on the incoming `pattern` is
+    /// ignored for existing entries.
     pub fn observe_pattern(&mut self, pattern: FieldPattern) {
         if let Some(existing) = self.patterns.iter_mut().find(|p| p.id == pattern.id) {
             existing.observation_count = existing.observation_count.saturating_add(1);
-            existing.confidence = (existing.confidence + pattern.confidence) / 2.0;
+            // Sanitise incoming confidence: replace NaN/inf with 0.0, then clamp.
+            let incoming = if pattern.confidence.is_finite() {
+                pattern.confidence.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            // Running average, re-clamped for safety.
+            existing.confidence = ((existing.confidence + incoming) / 2.0).clamp(0.0, 1.0);
         } else {
-            self.patterns.push(pattern);
+            let mut new_pattern = pattern;
+            // Normalise on insert: non-finite → 0.0, then clamp; count starts at ≥ 1.
+            new_pattern.confidence = if new_pattern.confidence.is_finite() {
+                new_pattern.confidence.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            new_pattern.observation_count = new_pattern.observation_count.max(1);
+            self.patterns.push(new_pattern);
         }
     }
 
@@ -452,5 +475,63 @@ mod tests {
             let back: EmergenceType = serde_json::from_str(&json).unwrap();
             assert_eq!(*et, back);
         }
+    }
+
+    // ── observe_pattern: confidence clamping ──
+
+    #[test]
+    fn observe_pattern_confidence_clamped_on_insert() {
+        let mut c = EvolutionChamber::new();
+        let mut p = test_pattern();
+        p.confidence = 1.5; // Out of range
+        c.observe_pattern(p);
+        assert!(c.patterns[0].confidence <= 1.0, "confidence must be clamped to [0.0, 1.0]");
+        assert!(c.patterns[0].confidence >= 0.0);
+    }
+
+    #[test]
+    fn observe_pattern_confidence_clamped_on_update() {
+        let mut c = EvolutionChamber::new();
+        c.observe_pattern(test_pattern()); // confidence 0.8
+        let mut p2 = test_pattern();
+        p2.confidence = -5.0; // Out of range
+        c.observe_pattern(p2);
+        assert!(c.patterns[0].confidence >= 0.0, "confidence must not go below 0.0");
+        assert!(c.patterns[0].confidence <= 1.0);
+    }
+
+    #[test]
+    fn observe_pattern_observation_count_starts_at_one() {
+        let mut c = EvolutionChamber::new();
+        let mut p = test_pattern();
+        p.observation_count = 0; // Caller passes zero
+        c.observe_pattern(p);
+        // Chamber normalises to 1 on insert
+        assert_eq!(c.patterns[0].observation_count, 1);
+    }
+
+    #[test]
+    fn observe_pattern_confidence_nan_replaced_with_zero() {
+        let mut c = EvolutionChamber::new();
+        let mut p = test_pattern();
+        p.confidence = f64::NAN;
+        c.observe_pattern(p);
+        // NaN is replaced with 0.0 before clamping.
+        assert!(
+            c.patterns[0].confidence.is_finite(),
+            "NaN confidence must be replaced with a finite value"
+        );
+        assert_eq!(c.patterns[0].confidence, 0.0);
+    }
+
+    #[test]
+    fn observe_pattern_confidence_inf_replaced_with_zero() {
+        let mut c = EvolutionChamber::new();
+        let mut p = test_pattern();
+        p.confidence = f64::INFINITY;
+        c.observe_pattern(p);
+        // Non-finite values (including INFINITY) are replaced with 0.0.
+        assert!(c.patterns[0].confidence.is_finite());
+        assert_eq!(c.patterns[0].confidence, 0.0);
     }
 }

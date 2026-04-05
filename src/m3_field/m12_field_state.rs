@@ -340,9 +340,17 @@ fn compute_r_trend(r_history: &VecDeque<f64>) -> RTrend {
     #[allow(clippy::cast_precision_loss)]
     let recent_count = r_history.iter().rev().take(5).count().max(1) as f64;
     let recent_avg: f64 = r_history.iter().rev().take(5).sum::<f64>() / recent_count;
+
+    // Only compare against older history if enough samples exist.
+    // Using .max(1) when count is 0 would produce a false older_avg of 0.0,
+    // triggering a spurious Rising trend whenever recent_avg > 0.
+    let older_count = r_history.iter().rev().skip(5).take(5).count();
+    if older_count == 0 {
+        return RTrend::Stable;
+    }
     #[allow(clippy::cast_precision_loss)]
-    let older_count = r_history.iter().rev().skip(5).take(5).count().max(1) as f64;
-    let older_avg: f64 = r_history.iter().rev().skip(5).take(5).sum::<f64>() / older_count;
+    let older_avg: f64 =
+        r_history.iter().rev().skip(5).take(5).sum::<f64>() / older_count as f64;
 
     let delta = recent_avg - older_avg;
 

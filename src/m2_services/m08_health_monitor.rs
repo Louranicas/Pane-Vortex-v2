@@ -6,6 +6,10 @@
 //! ## Layer: L2 (Services)
 //! ## Module: M08
 //! ## Dependencies: L1 (M01, M02), M07
+//!
+//! ## Audit Fixes (Agent-1, Session 089)
+//! - BUG-06: `should_check` had a redundant `if elapsed >= X { true } else { false }`
+//!   pattern — simplified to a direct boolean expression.
 
 use std::collections::HashMap;
 
@@ -92,17 +96,16 @@ impl ServiceHealth {
     }
 
     /// Whether this service should be checked (respects circuit breaker).
+    ///
+    /// When the circuit is open, allows a single probe through after
+    /// `CIRCUIT_RECOVERY_SECS` have elapsed (half-open recovery test).
     #[must_use]
     pub fn should_check(&self) -> bool {
         match self.circuit_state {
             CircuitState::Closed | CircuitState::HalfOpen => true,
             CircuitState::Open => {
                 let elapsed = now_secs() - self.last_checked;
-                if elapsed >= CIRCUIT_RECOVERY_SECS {
-                    true // Time to try half-open
-                } else {
-                    false
-                }
+                elapsed >= CIRCUIT_RECOVERY_SECS
             }
         }
     }

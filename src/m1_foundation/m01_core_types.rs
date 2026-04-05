@@ -12,6 +12,11 @@
 //! - C4: Zero unsafe/unwrap/expect
 //! - C5: Copy semantics for `Point3D` (24 bytes = 3×f64)
 //! - C7: Newtype wrappers for type safety (`PaneId`, `TaskId`, `Phase`)
+//!
+//! ## Audit Fixes (Agent-1, Session 089)
+//! - BUG-01: Removed duplicate `INBOX_MAX` constant — now re-exported from
+//!   `m04_constants` to eliminate shadow definition and ensure a single source
+//!   of truth.
 
 use std::fmt;
 use std::time::SystemTime;
@@ -429,7 +434,10 @@ pub struct InboxMessage {
 }
 
 /// Maximum inbox size (FIFO eviction beyond this).
-pub const INBOX_MAX: usize = 50;
+///
+/// Re-exported from `m04_constants` to keep `m01_core_types` self-contained
+/// for callers that only import this module.
+pub use super::m04_constants::INBOX_MAX;
 
 // ──────────────────────────────────────────────────────────────
 // Order parameter
