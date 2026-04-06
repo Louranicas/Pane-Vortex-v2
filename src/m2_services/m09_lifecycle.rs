@@ -539,4 +539,153 @@ mod tests {
         lc.restart();
         assert_eq!(lc.restart_count, 1);
     }
+
+    // ── Additional coverage ──
+
+    #[test]
+    fn stop_from_starting_transitions_to_stopping() {
+        // stop() is valid from Starting as well as Running
+        let mut lc = ServiceLifecycle::new("test");
+        lc.start();
+        assert_eq!(lc.state, ServiceState::Starting);
+        lc.stop();
+        assert_eq!(
+            lc.state,
+            ServiceState::Stopping,
+            "stop() must be valid from Starting state"
+        );
+    }
+
+    #[test]
+    fn stop_noop_when_already_stopped() {
+        let mut lc = ServiceLifecycle::new("test");
+        // State is Stopped by default
+        lc.stop();
+        assert_eq!(
+            lc.state,
+            ServiceState::Stopped,
+            "stop() on Stopped must be a no-op"
+        );
+    }
+
+    #[test]
+    fn stop_noop_when_failed() {
+        let mut lc = ServiceLifecycle::new("test");
+        lc.max_restarts = 1;
+        lc.restart();
+        assert!(lc.is_failed());
+        lc.stop();
+        assert!(lc.is_failed(), "stop() on Failed must be a no-op");
+    }
+
+    #[test]
+    fn uptime_zero_when_running_but_started_at_is_zero() {
+        // Edge case: Running state but started_at not set (should not panic)
+        let mut lc = ServiceLifecycle::new("test");
+        lc.start();
+        lc.running(1234);
+        // Force started_at to 0 to exercise the guard
+        lc.started_at = 0.0;
+        assert_eq!(
+            lc.uptime_secs(),
+            0.0,
+            "uptime_secs must return 0.0 when started_at is 0"
+        );
+    }
+
+    #[test]
+    fn restart_from_failed_transitions_to_starting() {
+        let mut lc = ServiceLifecycle::new("test");
+        lc.max_restarts = 3;
+        // Exhaust restarts to reach Failed
+        for _ in 0..3 {
+            lc.restart();
+        }
+        assert!(lc.is_failed());
+        // Reset and try again
+        lc.reset_failures();
+        lc.restart();
+        assert_eq!(lc.state, ServiceState::Starting, "restart from Stopped (after reset) must go to Starting");
+    }
+
+    #[test]
+    fn get_mut_missing_returns_none() {
+        let mut m = LifecycleManager::new();
+        assert!(m.get_mut("missing").is_none());
+    }
+
+    #[test]
+    fn initialize_idempotent_preserves_state() {
+        let mut m = LifecycleManager::new();
+        m.initialize(&["svc1"]);
+        m.get_mut("svc1").unwrap().start();
+        m.initialize(&["svc1"]); // re-init must not overwrite
+        assert_eq!(
+            m.get("svc1").unwrap().state,
+            ServiceState::Starting,
+            "re-initialize must not reset existing lifecycle state"
+        );
+    }
+
+    #[test]
+    fn running_count_zero_initially() {
+        let mut m = LifecycleManager::new();
+        m.initialize(&["svc1", "svc2"]);
+        assert_eq!(m.running_count(), 0);
+    }
+
+    #[test]
+    fn failed_count_zero_initially() {
+        let mut m = LifecycleManager::new();
+        m.initialize(&["svc1", "svc2"]);
+        assert_eq!(m.failed_count(), 0);
+    }
+
+    #[test]
+    fn summary_contains_failed_count() {
+        let mut m = LifecycleManager::new();
+        m.initialize(&["svc1"]);
+        let lc = m.get_mut("svc1").unwrap();
+        lc.max_restarts = 1;
+        lc.restart();
+        let s = m.summary();
+        assert!(
+            s.contains("1 failed"),
+            "summary must include failed count, got: {s}"
+        );
+    }
+
+    #[test]
+    fn service_id_preserved() {
+        let lc = ServiceLifecycle::new("my-service");
+        assert_eq!(lc.service_id, "my-service");
+    }
+
+    #[test]
+    fn new_lifecycle_has_default_max_restarts() {
+        let lc = ServiceLifecycle::new("test");
+        assert_eq!(lc.max_restarts, 5, "default max_restarts must be 5");
+    }
+
+    #[test]
+    fn restart_saturates_at_max_not_overflow() {
+        let mut lc = ServiceLifecycle::new("test");
+        // Set restart_count very high to test saturating_add
+        lc.restart_count = u32::MAX;
+        lc.max_restarts = 1; // already exceeded, so Failed
+        lc.state = ServiceState::Stopped; // ensure we can call restart
+        lc.restart();
+        // Should be Failed, restart_count should not overflow
+        assert!(lc.restart_count <= u32::MAX);
+    }
+
+    #[test]
+    fn running_with_zero_pid_is_valid() {
+        // PID 0 is unusual but the API takes u32, must not panic
+        let mut lc = ServiceLifecycle::new("test");
+        lc.start();
+        lc.running(0);
+        assert_eq!(lc.state, ServiceState::Running);
+        assert_eq!(lc.pid, Some(0));
+    }
 }

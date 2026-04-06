@@ -45,6 +45,15 @@
 //!   replaced with `map_or` for clarity.
 //! - Agent-4: Bind variable mismatch in `deregister_handler` — `let ghost = {`
 //!   binding corrected to `let (total_steps, mem_count) = {` to match tuple return.
+//!
+//! ## Async Correctness Fixes (Agent-1, Session 089 Gen-4)
+//! - ASYNC-01: `bus_suggestions_handler` held `bus_state` read lock across
+//!   `serde_json::json!()` macro execution. Fixed by collecting owned
+//!   `Vec<serde_json::Value>` inside the lock block, releasing before JSON work.
+//! - ASYNC-05: `bus_events_ingest_handler` acquired `bus.write()` then iterated
+//!   up to 100 events building `event_type` strings inside the lock. Fixed by
+//!   building all `BusEvent` values first, then taking a single write lock for
+//!   all ring-buffer insertions — minimising write-lock hold time.
 //! - Agent-4: All deep-path L7/L8 imports consolidated to layer re-export paths.
 
 use std::net::SocketAddr;
@@ -917,12 +926,23 @@ async fn steer_handler(
 }
 
 /// GET /bus/suggestions -- Field-driven suggestions (Gap 3 — stub).
+///
+/// Lock is held only for the duration of the `clone()` calls; JSON serialization
+/// happens after the guard is dropped to avoid holding a `RwLock` across
+/// potentially slow `serde_json` work.
 async fn bus_suggestions_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
-    let bus = ctx.bus.read();
-    let suggestions: Vec<&serde_json::Value> = bus.recent_suggestions(20);
+    // Collect owned values inside a short brace block, releasing the guard before
+    // the serde_json macro runs (ASYNC-01 fix).
+    let (suggestions, total_generated) = {
+        let bus = ctx.bus.read();
+        let suggestions: Vec<serde_json::Value> =
+            bus.recent_suggestions(20).into_iter().cloned().collect();
+        let total = bus.total_suggestions();
+        (suggestions, total)
+    };
     Json(serde_json::json!({
         "suggestions": suggestions,
-        "total_generated": bus.total_suggestions(),
+        "total_generated": total_generated,
     }))
 }
 
@@ -1238,27 +1258,39 @@ async fn bus_events_ingest_handler(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
 
-    // Publish each event into the bus ring buffer.
-    // into_iter() consumes each Value in-place — no clone of event data needed.
-    let mut bus = ctx.bus.write();
-    let mut ingested = 0u32;
-    for event_val in events.into_iter().take(batch_size) {
-        let me_type = event_val
-            .get("event_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned();
+    // Build all BusEvent values BEFORE acquiring the write lock (ASYNC-05 fix).
+    // Constructing event_type strings and reading JSON fields while holding a
+    // write lock would block all bus readers for the full batch duration.
+    // Building first means the write lock is held only for the O(n) ring-buffer
+    // insertions, not for the JSON field lookups and String formatting.
+    let bus_events: Vec<BusEvent> = events
+        .into_iter()
+        .take(batch_size)
+        .map(|event_val| {
+            let me_type = event_val
+                .get("event_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            BusEvent {
+                event_type: format!("{source}.{channel}.{me_type}"),
+                data: event_val,
+                tick,
+                timestamp,
+            }
+        })
+        .collect();
 
-        let bus_event = BusEvent {
-            event_type: format!("{source}.{channel}.{me_type}"),
-            data: event_val,
-            tick,
-            timestamp,
-        };
-        bus.publish_event(bus_event);
-        ingested += 1;
+    #[allow(clippy::cast_possible_truncation)]
+    let ingested = bus_events.len() as u32;
+
+    // Single write-lock acquisition: publish all pre-built events atomically.
+    {
+        let mut bus = ctx.bus.write();
+        for bus_event in bus_events {
+            bus.publish_event(bus_event);
+        }
     }
-    drop(bus);
 
     tracing::info!(
         source = source.as_str(),

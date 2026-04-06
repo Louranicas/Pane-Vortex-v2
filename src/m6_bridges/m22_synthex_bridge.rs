@@ -83,8 +83,9 @@ pub struct HeatSource {
 impl ThermalResponse {
     /// Compute the thermal k-adjustment from temperature deviation.
     ///
-    /// V1 pattern: `(1.0 - deviation * 0.2).clamp(0.8, 1.2)`
-    /// Cold → boost coupling (>1.0), hot → reduce coupling (<1.0).
+    /// Formula: `(1.0 - deviation * 0.2).clamp(K_MOD_BUDGET_MIN, K_MOD_BUDGET_MAX)`
+    /// where `deviation = temperature - target`. Clamped to [0.85, 1.15].
+    /// Cold (temperature < target) → boost coupling (>1.0), hot → reduce coupling (<1.0).
     #[must_use]
     pub fn thermal_adjustment(&self) -> f64 {
         let deviation = self.temperature - self.target;

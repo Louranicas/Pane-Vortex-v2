@@ -7,6 +7,15 @@
 //! ## Layer: L7 | Module: M29 | Dependencies: L1, L7 (M30 bus types)
 //! ## Wire Protocol: Handshake -> Welcome -> Subscribe/Submit/Event frames
 //! ## Design Constraints: C5 (lock ordering), C12 (bounded channel 256)
+//!
+//! ## Async Correctness Fixes (Agent-1, Session 089)
+//! - ASYNC-06: `get_current_uid()` now caches the result in a `OnceLock` so
+//!   `parse_uid_from_proc` (blocking `std::fs::read_to_string`) is called at
+//!   most once per process lifetime instead of on every IPC connection accept.
+//! - ASYNC-07: `handle_frame` now receives `is_v1: bool` as a parameter instead
+//!   of re-acquiring a `bus_state` read lock on every incoming frame to look up
+//!   the flag. The flag is immutable after handshake so passing it through
+//!   `read_loop` is semantically equivalent and eliminates one lock per frame.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -568,24 +577,22 @@ fn verify_peer_uid(stream: &tokio::net::UnixStream) -> PvResult<u32> {
 
 /// Get the current process UID.
 ///
-/// Uses `libc::getuid()` which is safe (no memory unsafety, just a syscall wrapper).
-/// The `libc` crate's `getuid` is declared as a safe extern function.
+/// The UID is parsed once from `/proc/self/status` at first call and cached in a
+/// `OnceLock` so that subsequent calls (one per IPC connection) incur only an
+/// atomic load instead of a blocking `read_to_string` syscall on the Tokio
+/// worker thread (ASYNC-06 fix).
+///
+/// Falls back to `u32::MAX` if the parse fails (treated as a mismatch, rejecting
+/// the connection safely).
 #[must_use]
 fn get_current_uid() -> u32 {
-    // libc::getuid() is a safe function despite being in the libc crate.
-    // It makes a simple syscall with no pointers or memory concerns.
-    // We use nix-style wrapping to stay within forbid(unsafe_code).
     #[cfg(unix)]
     {
-        // std::os::unix provides the uid via metadata, but we need our own PID's uid.
-        // The simplest safe approach: read /proc/self/status or use the nix crate.
-        // Since we have libc in deps and getuid is always safe on POSIX, we read
-        // from std::process::id() indirection. Actually, let's use a proc approach.
-        //
-        // Correction: we can call libc::getuid() because it IS safe even though
-        // it's an extern "C" function — Rust considers extern fn calls unsafe.
-        // Since we have forbid(unsafe_code), let's parse /proc/self/status.
-        parse_uid_from_proc().unwrap_or(u32::MAX)
+        use std::sync::OnceLock;
+        // OnceLock initializes once at first connection; all subsequent calls are
+        // a single atomic load — no blocking I/O on the hot accept path.
+        static CACHED_UID: OnceLock<u32> = OnceLock::new();
+        *CACHED_UID.get_or_init(|| parse_uid_from_proc().unwrap_or(u32::MAX))
     }
     #[cfg(not(unix))]
     {
@@ -594,6 +601,9 @@ fn get_current_uid() -> u32 {
 }
 
 /// Parse the current UID from `/proc/self/status` (safe, no `unsafe` needed).
+///
+/// Called at most once per process lifetime via `get_current_uid`'s `OnceLock`.
+/// Do not call this directly from async code — use `get_current_uid()` instead.
 ///
 /// # Errors
 /// Returns `None` if the file cannot be read or parsed.
@@ -870,11 +880,14 @@ async fn handle_connection(
     let writer_handle = tokio::spawn(writer_task(writer, rx));
 
     // ── Phase 2: Read loop ──
+    // Pass is_v1_client as a value so handle_frame does not need to re-acquire
+    // a read lock on every incoming frame just to look it up (ASYNC-07 fix).
     let result = read_loop(
         &mut reader,
         &mut line_buf,
         &tx,
         &session_id,
+        is_v1_client,
         &state,
         &bus_state,
     )
@@ -912,11 +925,16 @@ async fn writer_task(
 }
 
 /// Read NDJSON lines from the socket, dispatching each to `handle_frame`.
+///
+/// `is_v1` is passed in from `handle_connection` (determined at handshake) so
+/// that `handle_frame` does not need to re-acquire a `bus_state` read lock on
+/// every incoming frame (ASYNC-07 fix — eliminates one lock per frame).
 async fn read_loop(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     line_buf: &mut String,
     tx: &mpsc::Sender<String>,
     session_id: &str,
+    is_v1: bool,
     state: &SharedState,
     bus_state: &Arc<RwLock<BusState>>,
 ) -> PvResult<()> {
@@ -939,7 +957,7 @@ async fn read_loop(
                 };
 
                 let should_disconnect =
-                    handle_frame(frame, tx, session_id, state, bus_state).await?;
+                    handle_frame(frame, tx, session_id, is_v1, state, bus_state).await?;
 
                 if should_disconnect {
                     return Ok(());
@@ -1041,6 +1059,10 @@ async fn read_ndjson_line(
 
 /// Dispatch an incoming `BusFrame` from a connected client.
 ///
+/// `is_v1` is the wire-format flag determined at handshake time and passed
+/// through `read_loop` — this avoids re-acquiring a read lock on `bus_state`
+/// on every frame (ASYNC-07 fix).
+///
 /// Returns `true` if the connection should be closed (Disconnect frame).
 ///
 /// # Errors
@@ -1051,18 +1073,10 @@ async fn handle_frame(
     frame: BusFrame,
     tx: &mpsc::Sender<String>,
     session_id: &str,
+    is_v1: bool,
     state: &SharedState,
     bus_state: &Arc<RwLock<BusState>>,
 ) -> PvResult<bool> {
-    // Check if this subscriber uses V1 wire format (BUG-028 fix)
-    let is_v1 = {
-        let bus = bus_state.read();
-        bus.subscribers
-            .iter()
-            .find(|(sid, _)| *sid == session_id)
-            .is_some_and(|(_, sub)| sub.is_v1_client)
-    };
-
     match frame {
         BusFrame::Subscribe { patterns } => {
             let count = {
@@ -1836,7 +1850,7 @@ mod tests {
             patterns: vec!["field.*".into(), "sphere.*".into()],
         };
 
-        let disconnect = handle_frame(frame, &tx, session_id, &state, &bus_state)
+        let disconnect = handle_frame(frame, &tx, session_id, false, &state, &bus_state)
             .await
             .unwrap();
 
@@ -1862,7 +1876,7 @@ mod tests {
         let task = BusTask::new("test work".into(), TaskTarget::AnyIdle, pid("submitter"));
         let frame = BusFrame::Submit { task };
 
-        let disconnect = handle_frame(frame, &tx, session_id, &state, &bus_state)
+        let disconnect = handle_frame(frame, &tx, session_id, false, &state, &bus_state)
             .await
             .unwrap();
 
@@ -1889,7 +1903,7 @@ mod tests {
             reason: "session ending".into(),
         };
 
-        let disconnect = handle_frame(frame, &tx, session_id, &state, &bus_state)
+        let disconnect = handle_frame(frame, &tx, session_id, false, &state, &bus_state)
             .await
             .unwrap();
 
@@ -1910,7 +1924,7 @@ mod tests {
             version: "2.0".into(),
         };
 
-        let disconnect = handle_frame(frame, &tx, session_id, &state, &bus_state)
+        let disconnect = handle_frame(frame, &tx, session_id, false, &state, &bus_state)
             .await
             .unwrap();
 
@@ -1935,7 +1949,7 @@ mod tests {
             brief: "handoff context".into(),
         };
 
-        let disconnect = handle_frame(frame, &tx, session_id, &state, &bus_state)
+        let disconnect = handle_frame(frame, &tx, session_id, false, &state, &bus_state)
             .await
             .unwrap();
 

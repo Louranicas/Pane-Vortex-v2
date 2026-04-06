@@ -129,6 +129,11 @@ pub trait Consentable: Send + Sync + std::fmt::Debug {
 }
 
 /// Summary of a sphere's consent state.
+///
+/// Returned by [`Consentable::consent_posture`]. `PartialEq` is implemented
+/// manually because `f64` fields use epsilon comparison for `receptivity` and
+/// `max_k_adj` — two postures are equal when they have identical opt-outs and
+/// numerically equal float fields (within `f64::EPSILON`).
 #[derive(Debug, Clone)]
 pub struct ConsentPosture {
     /// Overall receptivity (0.0–1.0).
@@ -137,6 +142,31 @@ pub struct ConsentPosture {
     pub opt_outs: Vec<String>,
     /// Maximum k adjustment this sphere consents to.
     pub max_k_adj: Option<f64>,
+}
+
+impl PartialEq for ConsentPosture {
+    fn eq(&self, other: &Self) -> bool {
+        (self.receptivity - other.receptivity).abs() < f64::EPSILON
+            && self.opt_outs == other.opt_outs
+            && match (self.max_k_adj, other.max_k_adj) {
+                (Some(a), Some(b)) => (a - b).abs() < f64::EPSILON,
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl std::fmt::Display for ConsentPosture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ConsentPosture {{ receptivity: {:.3}, opt_outs: [{}], max_k_adj: {} }}",
+            self.receptivity,
+            self.opt_outs.join(", "),
+            self.max_k_adj
+                .map_or_else(|| "none".to_owned(), |v| format!("{v:.3}")),
+        )
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -244,5 +274,89 @@ mod tests {
         };
         assert!(posture.opt_outs.is_empty());
         assert!(posture.max_k_adj.is_none());
+    }
+
+    // ── ConsentPosture PartialEq ──
+
+    #[test]
+    fn consent_posture_partial_eq_identical() {
+        let a = ConsentPosture {
+            receptivity: 0.7,
+            opt_outs: vec!["hebbian".to_owned()],
+            max_k_adj: Some(0.2),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn consent_posture_partial_eq_different_receptivity() {
+        let a = ConsentPosture {
+            receptivity: 0.7,
+            opt_outs: vec![],
+            max_k_adj: None,
+        };
+        let b = ConsentPosture {
+            receptivity: 0.8,
+            opt_outs: vec![],
+            max_k_adj: None,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn consent_posture_partial_eq_different_opt_outs() {
+        let a = ConsentPosture {
+            receptivity: 0.5,
+            opt_outs: vec!["hebbian".to_owned()],
+            max_k_adj: None,
+        };
+        let b = ConsentPosture {
+            receptivity: 0.5,
+            opt_outs: vec!["observation".to_owned()],
+            max_k_adj: None,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn consent_posture_partial_eq_max_k_adj_none_vs_some() {
+        let a = ConsentPosture {
+            receptivity: 0.5,
+            opt_outs: vec![],
+            max_k_adj: None,
+        };
+        let b = ConsentPosture {
+            receptivity: 0.5,
+            opt_outs: vec![],
+            max_k_adj: Some(0.1),
+        };
+        assert_ne!(a, b);
+    }
+
+    // ── ConsentPosture Display ──
+
+    #[test]
+    fn consent_posture_display_with_opt_outs() {
+        let p = ConsentPosture {
+            receptivity: 0.8,
+            opt_outs: vec!["hebbian".to_owned()],
+            max_k_adj: Some(0.15),
+        };
+        let s = format!("{p}");
+        assert!(s.contains("receptivity"));
+        assert!(s.contains("hebbian"));
+        assert!(s.contains("0.150"));
+    }
+
+    #[test]
+    fn consent_posture_display_no_opt_outs() {
+        let p = ConsentPosture {
+            receptivity: 1.0,
+            opt_outs: vec![],
+            max_k_adj: None,
+        };
+        let s = format!("{p}");
+        assert!(s.contains("none"));
     }
 }

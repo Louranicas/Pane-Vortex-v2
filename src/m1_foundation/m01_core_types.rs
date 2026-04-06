@@ -1109,4 +1109,357 @@ mod tests {
         let back: Buoy = serde_json::from_str(&json).unwrap();
         assert_eq!(back.label, "cluster");
     }
+
+    // ── Safety Invariant: PaneId never empty (INV-4) ──
+
+    /// INV-4: `PaneId` construction with empty string must produce an empty
+    /// inner value — the type itself does NOT enforce non-empty; that is the
+    /// responsibility of `validate_pane_id` in m06_validation.
+    /// These tests document the current contract so any future enforcement
+    /// at the type level is reflected here.
+    #[test]
+    fn inv4_pane_id_new_empty_string_is_allowed_at_type_level() {
+        // PaneId::new does NOT reject empty strings — validation is caller's job.
+        // This test documents the contract: empty is structurally valid but
+        // semantically invalid (enforced by validate_pane_id).
+        let id = PaneId::new("");
+        assert_eq!(id.as_str(), "", "empty PaneId stores empty string");
+        assert_eq!(id, PaneId::default(), "default PaneId is empty");
+    }
+
+    #[test]
+    fn inv4_pane_id_from_empty_str() {
+        let id = PaneId::from("");
+        assert_eq!(id.as_str(), "");
+    }
+
+    #[test]
+    fn inv4_pane_id_whitespace_only() {
+        // Whitespace-only PaneId is structurally accepted but semantically invalid.
+        let id = PaneId::new("   ");
+        assert_eq!(id.as_str(), "   ");
+        assert_eq!(id.as_str().len(), 3);
+    }
+
+    #[test]
+    fn inv4_pane_id_unicode_accepted() {
+        // Unicode characters are structurally valid in PaneId (no char restriction at this layer).
+        let id = PaneId::new("日本語テスト");
+        assert_eq!(id.as_str(), "日本語テスト");
+    }
+
+    #[test]
+    fn inv4_pane_id_unicode_display_roundtrip() {
+        let id = PaneId::new("探検家:session-039");
+        assert_eq!(format!("{id}"), "探検家:session-039");
+    }
+
+    #[test]
+    fn inv4_pane_id_emoji_is_stored() {
+        let id = PaneId::new("fleet-🔭-alpha");
+        assert_eq!(id.as_str(), "fleet-🔭-alpha");
+    }
+
+    #[test]
+    fn inv4_pane_id_max_boundary_accepted() {
+        let max_id = "a".repeat(128);
+        let id = PaneId::new(&max_id);
+        assert_eq!(id.as_str().len(), 128);
+    }
+
+    #[test]
+    fn inv4_pane_id_equality_empty_strings() {
+        let a = PaneId::new("");
+        let b = PaneId::new("");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn inv4_pane_id_inequality_empty_vs_nonempty() {
+        let empty = PaneId::new("");
+        let nonempty = PaneId::new("x");
+        assert_ne!(empty, nonempty);
+    }
+
+    #[test]
+    fn inv4_pane_id_as_str_matches_display() {
+        let inputs = ["test", "", "fleet:alpha", "日本", "a-b_c.d"];
+        for s in inputs {
+            let id = PaneId::new(s);
+            assert_eq!(id.as_str(), format!("{id}").as_str());
+        }
+    }
+
+    // ── Safety Invariant: phase arithmetic always stays in [0, TAU) (INV-3 core) ──
+
+    #[test]
+    fn inv3_phase_diff_always_in_neg_pi_to_pi() {
+        // Property: phase_diff(a, b) ∈ [-π, π] for all finite a, b.
+        let test_values: &[f64] = &[
+            0.0, 0.001, 0.1, 1.0, PI, TAU - 0.001, TAU, TAU + 1.0, -0.001, -1.0, -PI,
+            100.0, -100.0, 1234.5678,
+        ];
+        for &a in test_values {
+            for &b in test_values {
+                let d = phase_diff(a, b);
+                assert!(
+                    d >= -PI && d <= PI,
+                    "phase_diff({a}, {b}) = {d} is outside [-π, π]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inv3_phase_diff_antisymmetric() {
+        // phase_diff(a, b) should be the negative of phase_diff(b, a) modulo wrap.
+        let pairs: &[(f64, f64)] = &[
+            (0.5, 1.0),
+            (PI, 0.0),
+            (TAU - 0.1, 0.1),
+            (1.0, 5.0),
+        ];
+        for &(a, b) in pairs {
+            let fwd = phase_diff(a, b);
+            let rev = phase_diff(b, a);
+            // They should sum to 0 unless we're on the -π/π boundary
+            let sum = fwd + rev;
+            let is_boundary = (sum.abs() - TAU).abs() < 1e-10;
+            assert!(
+                sum.abs() < 1e-10 || is_boundary,
+                "phase_diff({a},{b})={fwd} + phase_diff({b},{a})={rev} = {sum}, expected 0 or ±τ"
+            );
+        }
+    }
+
+    #[test]
+    fn inv3_semantic_phase_region_always_in_range_property() {
+        // Property: semantic_phase_region always returns value in [0, TAU).
+        let long_name = "z".repeat(200);
+        let tool_names: &[&str] = &[
+            "Read", "Write", "Edit", "Bash", "Grep", "Glob", "Agent",
+            "", "unknown-tool-xyz", "custom:handler", "mcp__tool__action",
+            "A", long_name.as_str(), "🔭", "日本語",
+        ];
+        for name in tool_names {
+            let p = semantic_phase_region(name);
+            assert!(
+                p >= 0.0 && p < TAU,
+                "semantic_phase_region({name:?}) = {p} is outside [0, TAU)"
+            );
+        }
+    }
+
+    #[test]
+    fn inv3_semantic_phase_region_deterministic_property() {
+        // Property: same input always produces same output.
+        let names = ["Read:file.rs", "Write:output.txt", "custom-tool", ""];
+        for name in names {
+            let first = semantic_phase_region(name);
+            let second = semantic_phase_region(name);
+            assert_relative_eq!(
+                first,
+                second,
+                epsilon = f64::EPSILON,
+                max_relative = f64::EPSILON
+            );
+        }
+    }
+
+    #[test]
+    fn inv3_rem_euclid_tau_property_various_inputs() {
+        // Property: x.rem_euclid(TAU) ∈ [0, TAU) for any finite x.
+        let inputs: &[f64] = &[
+            0.0, 0.001, PI, TAU - 0.001, TAU, TAU + 0.001,
+            -0.001, -PI, -TAU, -TAU - 0.001,
+            100.0 * TAU, -100.0 * TAU,
+            1.0e-15, -1.0e-15,
+        ];
+        for &x in inputs {
+            let wrapped = x.rem_euclid(TAU);
+            assert!(
+                wrapped >= 0.0 && wrapped < TAU,
+                "rem_euclid({x}) = {wrapped} out of [0, TAU)"
+            );
+        }
+    }
+
+    // ── Safety Invariant: `FleetMode::from_count` covers all boundaries (INV-fleet) ──
+
+    #[test]
+    fn inv_fleet_mode_boundary_zero() {
+        assert_eq!(FleetMode::from_count(0), FleetMode::Solo);
+    }
+
+    #[test]
+    fn inv_fleet_mode_boundary_one() {
+        assert_eq!(FleetMode::from_count(1), FleetMode::Solo);
+    }
+
+    #[test]
+    fn inv_fleet_mode_boundary_two_is_pair() {
+        assert_eq!(FleetMode::from_count(2), FleetMode::Pair);
+    }
+
+    #[test]
+    fn inv_fleet_mode_boundary_three_is_small() {
+        assert_eq!(FleetMode::from_count(3), FleetMode::Small);
+    }
+
+    #[test]
+    fn inv_fleet_mode_boundary_four_is_small() {
+        assert_eq!(FleetMode::from_count(4), FleetMode::Small);
+    }
+
+    #[test]
+    fn inv_fleet_mode_boundary_five_is_full() {
+        assert_eq!(FleetMode::from_count(5), FleetMode::Full);
+    }
+
+    #[test]
+    fn inv_fleet_mode_large_count_is_full() {
+        for n in [10_usize, 100, 200, 1000, usize::MAX] {
+            assert_eq!(
+                FleetMode::from_count(n),
+                FleetMode::Full,
+                "count {n} must yield Full"
+            );
+        }
+    }
+
+    // ── Safety Invariant: `OrderParameter` r ∈ [0, 1] semantics (INV-r) ──
+
+    #[test]
+    fn inv_order_parameter_default_r_is_zero() {
+        assert_relative_eq!(OrderParameter::default().r, 0.0);
+    }
+
+    #[test]
+    fn inv_order_parameter_r_at_boundaries() {
+        // Verify the struct accepts r=0.0 and r=1.0 without panic
+        let op_min = OrderParameter { r: 0.0, psi: 0.0 };
+        let op_max = OrderParameter { r: 1.0, psi: TAU - f64::EPSILON };
+        assert_relative_eq!(op_min.r, 0.0);
+        assert_relative_eq!(op_max.r, 1.0);
+    }
+
+    // ── Safety Invariant: `TaskId` is never empty (INV-taskid) ──
+
+    #[test]
+    fn inv_task_id_new_is_non_empty() {
+        // TaskId::new generates a UUID v4 — must never be empty.
+        for _ in 0..20 {
+            let id = TaskId::new();
+            assert!(!id.as_str().is_empty(), "TaskId::new must not produce empty string");
+        }
+    }
+
+    #[test]
+    fn inv_task_id_unique_across_calls() {
+        // UUID v4 is probabilistically unique — verify 100 consecutive calls are all distinct.
+        use std::collections::HashSet;
+        let ids: HashSet<String> = (0..100).map(|_| TaskId::new().as_str().to_owned()).collect();
+        assert_eq!(ids.len(), 100, "all generated TaskIds must be unique");
+    }
+
+    #[test]
+    fn inv_task_id_from_existing_preserves_value() {
+        let id = TaskId::from_existing("fixed-id-12345");
+        assert_eq!(id.as_str(), "fixed-id-12345");
+    }
+
+    // ── Safety Invariant: `Point3D::normalized()` always returns unit vector (INV-norm) ──
+
+    #[test]
+    fn inv_point3d_normalized_is_always_unit() {
+        let cases = [
+            Point3D::new(1.0, 0.0, 0.0),
+            Point3D::new(0.0, 1.0, 0.0),
+            Point3D::new(0.0, 0.0, 1.0),
+            Point3D::new(3.0, 4.0, 0.0),         // norm = 5
+            Point3D::new(1.0, 1.0, 1.0),          // norm = sqrt(3)
+            Point3D::new(0.0, 0.0, 0.0),          // degenerate → north pole
+            Point3D::new(f64::EPSILON, 0.0, 0.0), // nearly zero
+            Point3D::new(-1.0, -2.0, -3.0),       // negative components
+        ];
+        for p in cases {
+            let n = p.normalized();
+            let norm = n.norm();
+            assert_relative_eq!(norm, 1.0, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn inv_point3d_zero_normalizes_to_north() {
+        let zero = Point3D::new(0.0, 0.0, 0.0);
+        let n = zero.normalized();
+        assert_eq!(n, Point3D::north(), "zero vector must normalize to north pole");
+    }
+
+    // ── Safety Invariant: `now_secs()` is always positive (INV-time) ──
+
+    #[test]
+    fn inv_now_secs_is_always_positive_finite() {
+        for _ in 0..10 {
+            let t = now_secs();
+            assert!(t.is_finite(), "now_secs() must be finite");
+            assert!(t > 0.0, "now_secs() must be positive");
+            // Sanity: we're past 2020
+            assert!(t > 1_577_836_800.0, "now_secs() must be past 2020-01-01");
+        }
+    }
+
+    #[test]
+    fn inv_now_secs_monotonically_non_decreasing() {
+        let t1 = now_secs();
+        let t2 = now_secs();
+        assert!(t2 >= t1, "now_secs() must be non-decreasing: {t1} > {t2}");
+    }
+
+    // ── Safety Invariant: `FieldAction` serde is exhaustive (INV-serde-enum) ──
+
+    #[test]
+    fn inv_field_action_all_variants_serde_roundtrip() {
+        let variants = [
+            FieldAction::Stable,
+            FieldAction::NeedsCoherence,
+            FieldAction::NeedsDivergence,
+            FieldAction::HasBlockedAgents,
+            FieldAction::IdleFleet,
+            FieldAction::FreshFleet,
+            FieldAction::Recovering,
+            FieldAction::OverSynchronized,
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: FieldAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back, "FieldAction::{v:?} must survive serde roundtrip");
+        }
+    }
+
+    #[test]
+    fn inv_fleet_mode_all_variants_serde_roundtrip() {
+        let variants = [FleetMode::Solo, FleetMode::Pair, FleetMode::Small, FleetMode::Full];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: FleetMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back, "FleetMode::{v:?} must survive serde roundtrip");
+        }
+    }
+
+    // ── Safety Invariant: `SphereMemory` activation clamped at construction (INV-activation) ──
+
+    #[test]
+    fn inv_sphere_memory_activation_is_one_at_construction() {
+        let m = SphereMemory::new(1, Point3D::north(), "Read".into(), "test".into());
+        assert_relative_eq!(m.activation, 1.0, epsilon = f64::EPSILON);
+        assert!(m.activation >= 0.0 && m.activation <= 1.0);
+    }
+
+    #[test]
+    fn inv_sphere_memory_timestamp_is_positive() {
+        let m = SphereMemory::new(0, Point3D::north(), "Test".into(), "".into());
+        assert!(m.timestamp > 0.0, "SphereMemory timestamp must be positive");
+        assert!(m.timestamp.is_finite(), "SphereMemory timestamp must be finite");
+    }
 }

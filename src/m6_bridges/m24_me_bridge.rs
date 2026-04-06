@@ -341,7 +341,12 @@ impl Bridgeable for MeBridge {
 // Raw TCP HTTP helpers
 // ──────────────────────────────────────────────────────────────
 
-/// Send a raw HTTP GET request over TCP.
+/// Send a raw HTTP GET request over TCP and return the response body.
+///
+/// # Errors
+/// Returns `PvError::BridgeUnreachable` if the address cannot be parsed, the
+/// TCP connection fails, the read timeout is exceeded, or an I/O error occurs.
+/// Returns `PvError::BridgeParse` if the response contains no HTTP header/body separator.
 fn raw_http_get(addr: &str, path: &str, service: &str) -> PvResult<String> {
     let timeout = Duration::from_millis(TCP_TIMEOUT_MS);
     let mut stream = TcpStream::connect_timeout(

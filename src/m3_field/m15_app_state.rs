@@ -660,6 +660,238 @@ mod tests {
         assert!(debug.contains("tick"));
     }
 
+    // ── Safety Invariant: sphere count consistency (INV-1) ──
+
+    /// INV-1: `sphere_count()` always equals `spheres.len()`.
+    /// These are the same field — but we test the accessor contract explicitly
+    /// so any future refactor that breaks the aliasing is caught.
+    #[test]
+    fn inv1_sphere_count_equals_hashmap_len_empty() {
+        let s = AppState::new();
+        assert_eq!(s.sphere_count(), s.spheres.len());
+    }
+
+    #[test]
+    fn inv1_sphere_count_equals_hashmap_len_after_insert() {
+        let mut s = AppState::new();
+        for i in 0..10_usize {
+            let id = pid(&format!("inv1-{i}"));
+            s.spheres.insert(id.clone(), PaneSphere::new(id, "test".into(), 0.1).unwrap());
+            // Invariant must hold after every single insertion
+            assert_eq!(
+                s.sphere_count(),
+                s.spheres.len(),
+                "after inserting sphere #{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn inv1_sphere_count_equals_hashmap_len_after_remove() {
+        let mut s = AppState::new();
+        // Populate
+        for i in 0..8_usize {
+            let id = pid(&format!("del-{i}"));
+            s.spheres.insert(id.clone(), PaneSphere::new(id, "test".into(), 0.1).unwrap());
+        }
+        // Remove every other sphere, checking invariant after each removal
+        for i in (0..8_usize).step_by(2) {
+            s.spheres.remove(&pid(&format!("del-{i}")));
+            assert_eq!(
+                s.sphere_count(),
+                s.spheres.len(),
+                "after removing sphere #{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn inv1_sphere_count_rapid_add_remove_cycles() {
+        let mut s = AppState::new();
+        for cycle in 0..50_usize {
+            // Add a batch
+            for i in 0..5_usize {
+                let id = pid(&format!("cycle-{cycle}-{i}"));
+                s.spheres.insert(id.clone(), PaneSphere::new(id, "test".into(), 0.1).unwrap());
+            }
+            assert_eq!(s.sphere_count(), s.spheres.len(), "after add cycle {cycle}");
+
+            // Remove the batch
+            for i in 0..5_usize {
+                s.spheres.remove(&pid(&format!("cycle-{cycle}-{i}")));
+            }
+            assert_eq!(s.sphere_count(), s.spheres.len(), "after remove cycle {cycle}");
+        }
+        assert_eq!(s.sphere_count(), 0, "must return to zero after all cycles");
+    }
+
+    #[test]
+    fn inv1_sphere_count_matches_fleet_mode() {
+        let mut s = AppState::new();
+        assert_eq!(s.sphere_count(), 0);
+        assert_eq!(s.fleet_mode(), FleetMode::Solo);
+
+        s.spheres.insert(pid("a"), PaneSphere::new(pid("a"), "a".into(), 0.1).unwrap());
+        assert_eq!(s.sphere_count(), 1);
+
+        s.spheres.insert(pid("b"), PaneSphere::new(pid("b"), "b".into(), 0.1).unwrap());
+        assert_eq!(s.sphere_count(), 2);
+        assert_eq!(s.fleet_mode(), FleetMode::Pair);
+    }
+
+    #[test]
+    fn inv1_re_insert_same_id_keeps_count_stable() {
+        // HashMap semantics: inserting the same key twice counts as one entry.
+        let mut s = AppState::new();
+        s.spheres.insert(pid("dup"), PaneSphere::new(pid("dup"), "first".into(), 0.1).unwrap());
+        s.spheres.insert(pid("dup"), PaneSphere::new(pid("dup"), "second".into(), 0.1).unwrap());
+        assert_eq!(s.sphere_count(), 1);
+        assert_eq!(s.sphere_count(), s.spheres.len());
+    }
+
+    // ── Safety Invariant: phase remains in [0, TAU) (INV-3) ──
+
+    /// INV-3: After `record_memory`, the sphere phase must remain in [0, TAU).
+    #[test]
+    fn inv3_phase_in_range_after_record_memory() {
+        use std::f64::consts::TAU;
+        let mut s = AppState::new();
+        let id = pid("phase-test");
+        let mut sphere = PaneSphere::new(id.clone(), "tester".into(), 0.1).unwrap();
+
+        // Drive record_memory with many different tool names — each nudges phase
+        for tool in &["Read", "Write", "Edit", "Bash", "Grep", "Glob", "Agent", "unknown-xyz"] {
+            sphere.record_memory((*tool).into(), "summary".into());
+            assert!(
+                sphere.phase >= 0.0 && sphere.phase < TAU,
+                "phase {:.6} out of [0, TAU) after recording tool '{tool}'",
+                sphere.phase
+            );
+        }
+        s.spheres.insert(id, sphere);
+    }
+
+    #[test]
+    fn inv3_phase_in_range_after_step() {
+        use std::f64::consts::TAU;
+        let mut sphere = PaneSphere::new(pid("step-test"), "tester".into(), 0.1).unwrap();
+
+        // Run 200 steps — enough for momentum decay and phase evolution
+        for step in 0..200 {
+            sphere.step();
+            assert!(
+                sphere.phase >= 0.0 && sphere.phase < TAU,
+                "phase {:.6} out of [0, TAU) at step {step}",
+                sphere.phase
+            );
+        }
+    }
+
+    #[test]
+    fn inv3_phase_in_range_after_steer_toward() {
+        use std::f64::consts::TAU;
+        let mut sphere = PaneSphere::new(pid("steer-test"), "tester".into(), 0.1).unwrap();
+
+        // Steer toward various targets then step to apply momentum
+        let targets = [0.0_f64, 1.0, std::f64::consts::PI, TAU * 0.75, TAU - 0.001];
+        for &target in &targets {
+            sphere.steer_toward(target, 1.0);
+            sphere.step();
+            assert!(
+                sphere.phase >= 0.0 && sphere.phase < TAU,
+                "phase {:.6} out of [0, TAU) after steering toward {target:.4}",
+                sphere.phase
+            );
+        }
+    }
+
+    #[test]
+    fn inv3_phase_in_range_with_extreme_momentum() {
+        use std::f64::consts::TAU;
+        let mut sphere = PaneSphere::new(pid("extreme"), "tester".into(), 0.1).unwrap();
+
+        // Inject large momentum — phase must still wrap correctly
+        sphere.momentum = 100.0;
+        sphere.step();
+        assert!(
+            sphere.phase >= 0.0 && sphere.phase < TAU,
+            "phase {:.6} out of [0, TAU) with extreme positive momentum",
+            sphere.phase
+        );
+
+        sphere.momentum = -100.0;
+        sphere.step();
+        assert!(
+            sphere.phase >= 0.0 && sphere.phase < TAU,
+            "phase {:.6} out of [0, TAU) with extreme negative momentum",
+            sphere.phase
+        );
+    }
+
+    #[test]
+    fn inv3_all_sphere_phases_in_range_at_all_times() {
+        use std::f64::consts::TAU;
+        let mut s = AppState::new();
+
+        // Insert 5 spheres with varied initial states
+        for i in 0..5_usize {
+            #[allow(clippy::cast_precision_loss)]
+            let freq = 0.05 * (i + 1) as f64;
+            let id = pid(&format!("multi-{i}"));
+            let sphere = PaneSphere::new(id.clone(), "test".into(), freq).unwrap();
+            s.spheres.insert(id, sphere);
+        }
+
+        // Run record_memory on each sphere, then verify all phases
+        for (_, sphere) in &mut s.spheres {
+            sphere.record_memory("Read".into(), "test".into());
+            sphere.record_memory("Edit".into(), "test".into());
+            sphere.step();
+        }
+
+        for (id, sphere) in &s.spheres {
+            assert!(
+                sphere.phase >= 0.0 && sphere.phase < TAU,
+                "sphere {id} phase {:.6} out of [0, TAU)",
+                sphere.phase
+            );
+        }
+    }
+
+    // ── Safety Invariant: shared state concurrency (INV-SharedState) ──
+
+    #[test]
+    fn shared_state_concurrent_sphere_operations() {
+        // SharedState lock guards drop at end of blocks — verify count invariant holds
+        let ss = new_shared_state();
+
+        {
+            let mut guard = ss.write();
+            let id = pid("concurrent-a");
+            guard.spheres.insert(id.clone(), PaneSphere::new(id, "test".into(), 0.1).unwrap());
+            assert_eq!(guard.sphere_count(), guard.spheres.len());
+        }
+
+        {
+            let guard = ss.read();
+            assert_eq!(guard.sphere_count(), 1);
+        }
+
+        {
+            let mut guard = ss.write();
+            let id = pid("concurrent-b");
+            guard.spheres.insert(id.clone(), PaneSphere::new(id, "test".into(), 0.1).unwrap());
+            assert_eq!(guard.sphere_count(), 2);
+        }
+
+        {
+            let mut guard = ss.write();
+            guard.spheres.remove(&pid("concurrent-a"));
+            assert_eq!(guard.sphere_count(), 1);
+            assert_eq!(guard.sphere_count(), guard.spheres.len());
+        }
+    }
+
     // ── Serde roundtrip ──
 
     #[test]

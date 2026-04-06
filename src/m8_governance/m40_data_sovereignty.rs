@@ -356,4 +356,138 @@ mod tests {
         r.reject();
         assert_eq!(r.status, ForgetStatus::Rejected);
     }
+
+    // ── Additional coverage ──
+
+    #[test]
+    fn start_processing_idempotent_from_in_progress() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.start_processing();
+        assert_eq!(r.status, ForgetStatus::InProgress);
+        // Second call must be a no-op
+        r.start_processing();
+        assert_eq!(
+            r.status,
+            ForgetStatus::InProgress,
+            "start_processing must be idempotent when already InProgress"
+        );
+    }
+
+    #[test]
+    fn reject_idempotent_when_already_rejected() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.reject();
+        assert_eq!(r.status, ForgetStatus::Rejected);
+        // Second call must be a no-op (Rejected is not Pending or InProgress)
+        r.reject();
+        assert_eq!(r.status, ForgetStatus::Rejected);
+    }
+
+    #[test]
+    fn complete_noop_when_rejected() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.reject();
+        r.complete(42);
+        assert_eq!(
+            r.status,
+            ForgetStatus::Rejected,
+            "complete() must not apply to Rejected status"
+        );
+        assert_eq!(r.deleted_count, 0);
+    }
+
+    #[test]
+    fn manifest_only_ghost_trace_counts_one() {
+        let mut m = DataManifest::new(pid("test"));
+        m.has_ghost_trace = true;
+        m.compute_total();
+        assert_eq!(m.total_data_points, 1, "ghost trace alone counts as 1 data point");
+    }
+
+    #[test]
+    fn manifest_only_rm_entries_counts_one() {
+        let mut m = DataManifest::new(pid("test"));
+        m.has_rm_entries = true;
+        m.compute_total();
+        assert_eq!(m.total_data_points, 1, "rm entries alone count as 1 data point");
+    }
+
+    #[test]
+    fn manifest_only_povm_entries_counts_one() {
+        let mut m = DataManifest::new(pid("test"));
+        m.has_povm_entries = true;
+        m.compute_total();
+        assert_eq!(m.total_data_points, 1, "povm entries alone count as 1 data point");
+    }
+
+    #[test]
+    fn forget_request_tick_preserved() {
+        let r = ForgetRequest::new(pid("a"), 999, false);
+        assert_eq!(r.requested_at_tick, 999);
+    }
+
+    #[test]
+    fn forget_request_requested_at_is_positive() {
+        let r = ForgetRequest::new(pid("a"), 1, false);
+        assert!(
+            r.requested_at > 0.0,
+            "requested_at must be a positive unix timestamp"
+        );
+    }
+
+    #[test]
+    fn forget_status_in_progress_variant_distinct() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.start_processing();
+        assert_eq!(r.status, ForgetStatus::InProgress);
+        assert_ne!(r.status, ForgetStatus::Pending);
+        assert_ne!(r.status, ForgetStatus::Completed);
+        assert_ne!(r.status, ForgetStatus::Rejected);
+    }
+
+    #[test]
+    fn manifest_bus_event_and_task_counts() {
+        let mut m = DataManifest::new(pid("test"));
+        m.bus_event_count = 7;
+        m.bus_task_count = 3;
+        m.compute_total();
+        assert_eq!(m.total_data_points, 10);
+    }
+
+    #[test]
+    fn forget_serde_roundtrip_status_rejected() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.reject();
+        let json = serde_json::to_string(&r).unwrap();
+        let back: ForgetRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, ForgetStatus::Rejected);
+    }
+
+    #[test]
+    fn forget_serde_roundtrip_status_completed() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.start_processing();
+        r.complete(100);
+        let json = serde_json::to_string(&r).unwrap();
+        let back: ForgetRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, ForgetStatus::Completed);
+        assert_eq!(back.deleted_count, 100);
+    }
+
+    #[test]
+    fn manifest_compute_total_is_additive_and_repeatable() {
+        let mut m = DataManifest::new(pid("test"));
+        m.memory_count = 5;
+        m.compute_total();
+        let first = m.total_data_points;
+        m.compute_total(); // calling twice must produce the same result
+        assert_eq!(m.total_data_points, first, "compute_total must be idempotent");
+    }
+
+    #[test]
+    fn forget_status_default_is_pending() {
+        // ForgetStatus derives Default which is Pending
+        let s = ForgetStatus::default();
+        assert_eq!(s, ForgetStatus::Pending);
+    }
 }

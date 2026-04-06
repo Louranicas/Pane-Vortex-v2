@@ -19,7 +19,10 @@ use crate::m1_foundation::{m01_core_types::PaneId, m04_constants};
 // ──────────────────────────────────────────────────────────────
 
 /// Chimera state: simultaneous coexistence of synchronized and desynchronized clusters.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `PartialEq` and `Eq` are derived — all fields are either `bool` or `Vec<Cluster>`,
+/// and `Cluster` provides manual `PartialEq` + `Eq` with epsilon float comparison.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChimeraState {
     /// Whether a true chimera is present (multi-member sync + desync clusters).
     pub is_chimera: bool,
@@ -29,7 +32,22 @@ pub struct ChimeraState {
     pub desync_clusters: Vec<Cluster>,
 }
 
+impl std::fmt::Display for ChimeraState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ChimeraState {{ is_chimera: {}, sync_clusters: {}, desync_clusters: {} }}",
+            self.is_chimera,
+            self.sync_clusters.len(),
+            self.desync_clusters.len(),
+        )
+    }
+}
+
 /// A cluster of spheres identified by phase proximity.
+///
+/// `PartialEq` is implemented manually — `f64` fields (`local_r`, `mean_phase`)
+/// prevent a blanket `derive(PartialEq)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cluster {
     /// Sphere IDs in this cluster.
@@ -40,13 +58,53 @@ pub struct Cluster {
     pub mean_phase: f64,
 }
 
+impl PartialEq for Cluster {
+    fn eq(&self, other: &Self) -> bool {
+        self.members == other.members
+            && (self.local_r - other.local_r).abs() < f64::EPSILON
+            && (self.mean_phase - other.mean_phase).abs() < f64::EPSILON
+    }
+}
+
+/// Safety: the manual `PartialEq` is reflexive (x == x always) and symmetric
+/// by construction. Transitivity holds because it delegates to `Vec<PaneId>`
+/// equality plus epsilon-bound float equality. Implementing `Eq` allows
+/// `ChimeraState` to derive `Eq` and satisfies `clippy::derive_partial_eq_without_eq`.
+impl Eq for Cluster {}
+
+impl std::fmt::Display for Cluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cluster {{ members: {}, local_r: {:.4}, mean_phase: {:.4} }}",
+            self.members.len(),
+            self.local_r,
+            self.mean_phase,
+        )
+    }
+}
+
 /// Pre-computed routing targets from chimera state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Eq` is derived in addition to `PartialEq` — both fields are `Vec<PaneId>`
+/// and `PaneId` is `Eq`, satisfying the `derive(partial_eq_without_eq)` lint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChimeraRouting {
     /// Spheres suitable for focused, aligned work.
     pub focused: Vec<PaneId>,
     /// Spheres suitable for exploratory, divergent work.
     pub exploratory: Vec<PaneId>,
+}
+
+impl std::fmt::Display for ChimeraRouting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ChimeraRouting {{ focused: {}, exploratory: {} }}",
+            self.focused.len(),
+            self.exploratory.len(),
+        )
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -719,5 +777,113 @@ mod tests {
         // Should not panic and should return a valid (possibly single-cluster) state
         let c = ChimeraState::detect(&phases, 1.0);
         assert!(!c.is_chimera, "two spheres at same phase cannot be a chimera");
+    }
+
+    // ── PartialEq / Eq on Cluster ──
+
+    #[test]
+    fn cluster_partial_eq_identical() {
+        let c = Cluster {
+            members: vec![PaneId::new("a"), PaneId::new("b")],
+            local_r: 0.9,
+            mean_phase: 1.2,
+        };
+        assert_eq!(c, c.clone());
+    }
+
+    #[test]
+    fn cluster_partial_eq_different_members() {
+        let a = Cluster {
+            members: vec![PaneId::new("a")],
+            local_r: 0.9,
+            mean_phase: 1.2,
+        };
+        let b = Cluster {
+            members: vec![PaneId::new("b")],
+            local_r: 0.9,
+            mean_phase: 1.2,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cluster_partial_eq_different_local_r() {
+        let a = Cluster {
+            members: vec![PaneId::new("x")],
+            local_r: 0.8,
+            mean_phase: 0.0,
+        };
+        let b = Cluster {
+            members: vec![PaneId::new("x")],
+            local_r: 0.9,
+            mean_phase: 0.0,
+        };
+        assert_ne!(a, b);
+    }
+
+    // ── Display impls ──
+
+    #[test]
+    fn cluster_display_contains_count() {
+        let c = Cluster {
+            members: vec![PaneId::new("a"), PaneId::new("b")],
+            local_r: 0.95,
+            mean_phase: 1.5,
+        };
+        let s = format!("{c}");
+        assert!(s.contains("members: 2"), "display should show member count");
+        assert!(s.contains("local_r"), "display should show local_r label");
+    }
+
+    #[test]
+    fn chimera_state_display_shows_counts() {
+        let phases = make_phases(&[("a", 1.0), ("b", 1.1)]);
+        let c = ChimeraState::detect(&phases, 1.0);
+        let s = format!("{c}");
+        assert!(s.contains("is_chimera"));
+        assert!(s.contains("sync_clusters"));
+        assert!(s.contains("desync_clusters"));
+    }
+
+    #[test]
+    fn chimera_routing_display_shows_counts() {
+        let r = ChimeraRouting {
+            focused: vec![PaneId::new("a")],
+            exploratory: vec![PaneId::new("b"), PaneId::new("c")],
+        };
+        let s = format!("{r}");
+        assert!(s.contains("focused: 1"));
+        assert!(s.contains("exploratory: 2"));
+    }
+
+    // ── PartialEq on ChimeraState ──
+
+    #[test]
+    fn chimera_state_eq_default() {
+        let a = ChimeraState::default();
+        let b = ChimeraState::default();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn chimera_routing_eq_identical() {
+        let a = ChimeraRouting {
+            focused: vec![PaneId::new("a")],
+            exploratory: vec![],
+        };
+        assert_eq!(a, a.clone());
+    }
+
+    #[test]
+    fn chimera_routing_neq_different_focused() {
+        let a = ChimeraRouting {
+            focused: vec![PaneId::new("a")],
+            exploratory: vec![],
+        };
+        let b = ChimeraRouting {
+            focused: vec![PaneId::new("b")],
+            exploratory: vec![],
+        };
+        assert_ne!(a, b);
     }
 }

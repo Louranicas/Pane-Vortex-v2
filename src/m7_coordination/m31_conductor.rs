@@ -48,8 +48,9 @@ const THRASH_GUARD_TICKS: u32 = 3;
 /// PI breathing controller for the Kuramoto field.
 ///
 /// The conductor modulates `k_modulation` to steer the order parameter `r` toward
-/// a dynamic `r_target`. It blends a PI control signal with an emergent natural
-/// oscillation of the coupling field.
+/// a dynamic `r_target` using a PI control signal. The emergent breathing blend
+/// is computed by `emergent_breathing` but not yet wired into `conduct_breathing`;
+/// `breathing_blend` is reserved for a future coupling pass.
 #[derive(Debug)]
 pub struct Conductor {
     /// Proportional gain for the PI controller.
@@ -83,8 +84,8 @@ impl Conductor {
     ///
     /// Priority (highest to lowest):
     /// 1. Governance override (`r_target_override` from approved proposals)
-    /// 2. Fleet-negotiated: mean of spheres' `preferred_r` values
-    /// 3. Base: 0.93 (small/medium) or 0.85 (large >50 spheres)
+    /// 2. Fleet-negotiated blend: 70% mean `preferred_r` + 30% base (when any sphere expresses a preference)
+    /// 3. Base only: `R_TARGET_BASE` (0.93) for fleets ≤50 spheres, `R_TARGET_LARGE_FLEET` (0.85) for >50
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn r_target(state: &AppState) -> f64 {
@@ -119,9 +120,13 @@ impl Conductor {
         avg_preferred.mul_add(0.7, base * 0.3).clamp(0.5, 0.99)
     }
 
-    /// Conduct breathing: adjust `k_modulation` based on r deviation from `r_target`.
+    /// Conduct breathing: adjust `divergence_ema` based on r deviation from `r_target`.
     ///
-    /// This is the main control loop entry point called once per tick.
+    /// Called once per tick. Applies a PI control signal (proportional gain + slow
+    /// integral) to steer `r` toward `r_target`. Suppressed during `divergence_cooldown`
+    /// and by the thrash guard when the decision direction flips within
+    /// `THRASH_GUARD_TICKS` ticks. Both `divergence_ema` and `coherence_ema` decay
+    /// at α=0.95 every tick regardless of suppression.
     pub fn conduct_breathing(&self, state: &mut AppState, decision: &FieldDecision) {
         // Exponential decay on divergence_ema to prevent compounding/stickiness
         // at budget clamp boundary. α=0.95 gives ~37-tick half-life.
@@ -197,8 +202,9 @@ impl Conductor {
 
     /// Compute emergent breathing signal from the coupling field.
     ///
-    /// This captures the natural oscillation of the system by measuring
-    /// the variance of phase velocities — a proxy for collective rhythm.
+    /// Derives a signal from the order parameter's deviation from 0.8, modulated
+    /// by a slow sinusoidal oscillation (period ~60 ticks). The result is a proxy
+    /// for the field's natural breathing rhythm at the current tick.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     #[allow(dead_code)] // Emergent signal API; wired into tick_conductor breathing blend in future pass

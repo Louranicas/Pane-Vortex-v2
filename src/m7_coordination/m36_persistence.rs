@@ -842,4 +842,293 @@ mod tests {
             );
         }
     }
+
+    // ── Safety Invariant: save_snapshot → load_snapshot roundtrip (INV-2) ──
+
+    /// INV-2: `save_snapshot` then `load_snapshot` returns the exact same tick and JSON.
+    #[test]
+    fn inv2_snapshot_roundtrip_basic() {
+        let pm = test_manager();
+        let payload = r#"{"tick":42,"spheres":[],"r":0.75}"#;
+        pm.save_snapshot(42, 0.75, 1.2, 3, 100, 1.05, payload)
+            .unwrap();
+        let (tick, json) = pm.load_snapshot().unwrap();
+        assert_eq!(tick, 42, "tick must survive roundtrip");
+        assert_eq!(json, payload, "JSON must be bit-identical after roundtrip");
+    }
+
+    #[test]
+    fn inv2_snapshot_roundtrip_empty_state() {
+        let pm = test_manager();
+        let payload = r#"{"tick":0,"spheres":{},"r_history":[]}"#;
+        pm.save_snapshot(0, 0.0, 0.0, 0, 0, 1.0, payload).unwrap();
+        let (tick, json) = pm.load_snapshot().unwrap();
+        assert_eq!(tick, 0);
+        assert_eq!(json, payload);
+    }
+
+    #[test]
+    fn inv2_snapshot_roundtrip_special_floats_r_zero() {
+        let pm = test_manager();
+        let payload = r#"{"r":0.0}"#;
+        pm.save_snapshot(1, 0.0, 0.0, 0, 0, 0.0, payload).unwrap();
+        let (_, json) = pm.load_snapshot().unwrap();
+        assert_eq!(json, payload);
+    }
+
+    #[test]
+    fn inv2_snapshot_roundtrip_r_one() {
+        let pm = test_manager();
+        let payload = r#"{"r":1.0,"state":"fully_synchronized"}"#;
+        pm.save_snapshot(999, 1.0, 0.0, 10, 500, 1.0, payload)
+            .unwrap();
+        let (tick, json) = pm.load_snapshot().unwrap();
+        assert_eq!(tick, 999);
+        assert_eq!(json, payload);
+    }
+
+    #[test]
+    fn inv2_snapshot_roundtrip_max_spheres() {
+        // Simulate maximum sphere count scenario (SPHERE_CAP = 200)
+        let pm = test_manager();
+        let payload = format!(r#"{{"sphere_count":200,"tick":5000}}"#);
+        pm.save_snapshot(5000, 0.95, 3.14, 200, 10000, 1.15, &payload)
+            .unwrap();
+        let (tick, json) = pm.load_snapshot().unwrap();
+        assert_eq!(tick, 5000);
+        assert_eq!(json, payload);
+    }
+
+    #[test]
+    fn inv2_snapshot_roundtrip_load_is_latest_tick() {
+        // When multiple snapshots exist, load_snapshot must return the HIGHEST tick.
+        let pm = test_manager();
+        pm.save_snapshot(1, 0.1, 0.0, 1, 10, 1.0, r#"{"tick":1}"#)
+            .unwrap();
+        pm.save_snapshot(100, 0.5, 1.0, 3, 50, 1.0, r#"{"tick":100}"#)
+            .unwrap();
+        pm.save_snapshot(50, 0.3, 0.5, 2, 30, 1.0, r#"{"tick":50}"#)
+            .unwrap();
+        // 100 is the highest tick, must be returned even though inserted before 50
+        let (tick, json) = pm.load_snapshot().unwrap();
+        assert_eq!(tick, 100, "must return highest tick, not insertion order");
+        assert!(json.contains("100"));
+    }
+
+    #[test]
+    fn inv2_snapshot_roundtrip_unicode_payload() {
+        let pm = test_manager();
+        let payload = r#"{"persona":"探検家 🔭","note":"日本語テスト"}"#;
+        pm.save_snapshot(7, 0.8, 0.0, 1, 5, 1.0, payload).unwrap();
+        let (tick, json) = pm.load_snapshot().unwrap();
+        assert_eq!(tick, 7);
+        assert_eq!(json, payload, "unicode must survive roundtrip verbatim");
+    }
+
+    #[test]
+    fn inv2_snapshot_roundtrip_after_prune_latest_survives() {
+        // After pruning down to 1 entry, that entry must still roundtrip correctly.
+        let pm = test_manager();
+        let expected = r#"{"tick":99,"final":true}"#;
+        for i in 0..10_u64 {
+            let payload = format!(r#"{{"tick":{i}}}"#);
+            pm.save_snapshot(i, 0.5, 0.5, 1, 10, 1.0, &payload).unwrap();
+        }
+        pm.save_snapshot(99, 0.9, 1.0, 5, 100, 1.0, expected)
+            .unwrap();
+        pm.prune_snapshots(1).unwrap();
+        let (tick, json) = pm.load_snapshot().unwrap();
+        assert_eq!(tick, 99, "latest snapshot must survive prune");
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn inv2_snapshot_roundtrip_k_modulation_edge_zero() {
+        // k_modulation = 0.0 is a valid edge case (field fully suppressed)
+        let pm = test_manager();
+        let payload = r#"{"k_mod":0.0}"#;
+        pm.save_snapshot(1, 0.0, 0.0, 0, 0, 0.0, payload).unwrap();
+        let (_, json) = pm.load_snapshot().unwrap();
+        assert_eq!(json, payload);
+    }
+
+    #[test]
+    fn inv2_snapshot_roundtrip_large_tick_u64_near_max() {
+        // Tick is stored as i64 in SQLite — test near the i64::MAX boundary
+        // (u64::MAX overflows i64, so we test with i64::MAX cast to u64)
+        let pm = test_manager();
+        let large_tick = u64::from(u32::MAX);  // Safe: fits in both u64 and i64
+        let payload = r#"{"tick":"large"}"#;
+        pm.save_snapshot(large_tick, 0.5, 0.0, 1, 1, 1.0, payload)
+            .unwrap();
+        let (tick, json) = pm.load_snapshot().unwrap();
+        assert_eq!(tick, large_tick, "large tick must survive roundtrip");
+        assert_eq!(json, payload);
+    }
+
+    #[test]
+    fn inv2_no_snapshot_returns_error() {
+        // Loading from an empty DB must return an error, not a default value.
+        let pm = test_manager();
+        let result = pm.load_snapshot();
+        assert!(result.is_err(), "empty persistence must return Err, not default");
+    }
+
+    #[test]
+    fn inv2_snapshot_at_tick_roundtrip() {
+        // load_snapshot_at_tick must return the exact payload for that tick.
+        let pm = test_manager();
+        let payload_5 = r#"{"tick":5,"label":"five"}"#;
+        let payload_10 = r#"{"tick":10,"label":"ten"}"#;
+        pm.save_snapshot(5, 0.5, 0.5, 2, 50, 1.0, payload_5).unwrap();
+        pm.save_snapshot(10, 0.8, 1.0, 3, 100, 1.0, payload_10).unwrap();
+
+        let json5 = pm.load_snapshot_at_tick(5).unwrap();
+        assert_eq!(json5, payload_5, "tick-5 payload must roundtrip exactly");
+
+        let json10 = pm.load_snapshot_at_tick(10).unwrap();
+        assert_eq!(json10, payload_10, "tick-10 payload must roundtrip exactly");
+    }
+
+    // ── Safety Invariant: event persistence roundtrip (INV-event) ──
+
+    #[test]
+    fn inv_event_type_and_data_roundtrip() {
+        let pm = test_manager();
+        let event_type = "sphere.registered";
+        let data = r#"{"id":"my-sphere","persona":"explorer"}"#;
+        pm.save_event(event_type, data, 42).unwrap();
+        let events = pm.recent_events(1).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, event_type, "event_type must roundtrip");
+        assert_eq!(events[0].1, data, "event data must roundtrip verbatim");
+        assert_eq!(events[0].2, 42_u64, "tick must roundtrip");
+    }
+
+    #[test]
+    fn inv_event_ordering_newest_first() {
+        // recent_events returns most recent first — INV that ordering is newest-first.
+        let pm = test_manager();
+        for tick in 0..5_u64 {
+            pm.save_event("test", &format!(r#"{{"tick":{tick}}}"#), tick)
+                .unwrap();
+        }
+        let events = pm.recent_events(5).unwrap();
+        // Most recent (tick=4) must be first
+        assert_eq!(events[0].2, 4_u64, "newest event must be first");
+        assert_eq!(events[4].2, 0_u64, "oldest event must be last");
+    }
+
+    #[test]
+    fn inv_event_count_reflects_saved_events() {
+        let pm = test_manager();
+        // Start empty
+        assert_eq!(pm.event_count_by_type("field.tick").unwrap(), 0);
+
+        // Save 3 events
+        for i in 0..3_u64 {
+            pm.save_event("field.tick", "data", i).unwrap();
+        }
+        assert_eq!(
+            pm.event_count_by_type("field.tick").unwrap(),
+            3,
+            "event count must equal number saved"
+        );
+
+        // Different type does not interfere
+        pm.save_event("sphere.registered", "data", 10).unwrap();
+        assert_eq!(pm.event_count_by_type("field.tick").unwrap(), 3);
+        assert_eq!(pm.event_count_by_type("sphere.registered").unwrap(), 1);
+    }
+
+    // ── Safety Invariant: sphere history persistence (INV-sphere-history) ──
+
+    #[test]
+    fn inv_sphere_history_phase_stored_verbatim() {
+        // Phase values in sphere history are stored as-is (REAL column).
+        // Verify with a distinguishable value.
+        let pm = test_manager();
+        pm.save_sphere_history(1, "sphere-x", 1.234_567_89, 0.1, 5, 0.8, 0.9, "Working")
+            .unwrap();
+        // We don't expose a sphere history query, but can verify no error was raised
+        // and the schema column exists by querying via raw connection.
+        let conn = pm.open_field_db().unwrap();
+        let phase: f64 = conn
+            .query_row(
+                "SELECT phase FROM sphere_history WHERE sphere_id = 'sphere-x' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // SQLite REAL has ~15 sig digits — allow small epsilon
+        assert!(
+            (phase - 1.234_567_89).abs() < 1e-7,
+            "phase {phase} did not roundtrip accurately"
+        );
+    }
+
+    // ── Safety Invariant: prune preserves atomicity (INV-prune) ──
+
+    #[test]
+    fn inv_prune_keeps_exactly_n_snapshots() {
+        let pm = test_manager();
+        for i in 0..20_u64 {
+            pm.save_snapshot(i, 0.5, 0.5, 1, 1, 1.0, &format!("{{{i}}}")).unwrap();
+        }
+        pm.prune_snapshots(5).unwrap();
+
+        // Count remaining snapshots via raw query
+        let conn = pm.open_field_db().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM field_snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 5, "prune must leave exactly 5 snapshots");
+    }
+
+    #[test]
+    fn inv_prune_keeps_highest_tick_snapshots() {
+        let pm = test_manager();
+        for i in 0..10_u64 {
+            pm.save_snapshot(i, 0.5, 0.5, 1, 1, 1.0, &format!(r#"{{"tick":{i}}}"#)).unwrap();
+        }
+        pm.prune_snapshots(3).unwrap();
+
+        // After pruning to 3, the latest tick must still be loadable
+        let (tick, _) = pm.load_snapshot().unwrap();
+        assert_eq!(tick, 9, "highest-tick snapshot must survive prune");
+    }
+
+    #[test]
+    fn inv_prune_events_keeps_n_most_recent() {
+        let pm = test_manager();
+        for i in 0..20_u64 {
+            pm.save_event("test", &format!("{{{i}}}"), i).unwrap();
+        }
+        pm.prune_events(3).unwrap();
+        let events = pm.recent_events(100).unwrap();
+        assert_eq!(events.len(), 3, "prune_events must leave exactly 3 entries");
+        // Most recent event (tick=19) must be one of the survivors
+        assert_eq!(events[0].2, 19_u64, "most recent event must survive prune");
+    }
+
+    // ── Safety Invariant: WAL + synchronous = no data loss on close (INV-wal) ──
+
+    #[test]
+    fn inv_wal_mode_field_and_bus_both_enabled() {
+        let pm = test_manager();
+
+        // Field DB
+        let conn = pm.open_field_db().unwrap();
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal", "field DB must use WAL journal mode");
+
+        // Bus DB
+        let conn2 = pm.open_bus_db().unwrap();
+        let mode2: String = conn2
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode2.to_lowercase(), "wal", "bus DB must use WAL journal mode");
+    }
 }

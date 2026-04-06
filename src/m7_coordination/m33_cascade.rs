@@ -1,7 +1,7 @@
 //! # M33: Cascade System
 //!
 //! `CascadeHandoff`/`CascadeAck` frames. Rate limiting: max 10/minute. Depth tracking
-//! (auto-summarize at >3). Markdown fallback briefs for non-bus-aware recipients.
+//! (auto-summarize at depth >=3). Markdown fallback briefs for non-bus-aware recipients.
 //!
 //! ## Layer: L7 | Module: M33 | Dependencies: L1, L7 (M29 bus, M30 types)
 //! ## NA Gap: NA-P-7 (cascade rejection) — V3.3.3 adds `reject_cascade` frame
@@ -132,7 +132,7 @@ impl CascadeHandoff {
         now_secs() - self.dispatched_at
     }
 
-    /// Whether this cascade needs auto-summarization (depth > threshold).
+    /// Whether this cascade needs auto-summarization (depth >= `AUTO_SUMMARIZE_DEPTH`).
     #[must_use]
     #[allow(dead_code)] // Cascade depth check; wired to summarization callback in future L7 pass
     pub(crate) const fn needs_summarization(&self) -> bool {

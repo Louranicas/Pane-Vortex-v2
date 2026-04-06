@@ -29,6 +29,9 @@ use super::m13_chimera::{ChimeraRouting, ChimeraState};
 // ──────────────────────────────────────────────────────────────
 
 /// Simplified harmonic decomposition of phase distribution.
+///
+/// `PartialEq` is implemented manually — `f64` fields use epsilon comparison.
+/// `Eq` is intentionally not derived because `f64` is not `Eq`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HarmonicSpectrum {
     /// L=0: overall health (mean activation).
@@ -58,10 +61,43 @@ pub struct Tunnel {
     pub semantic_b: String,
 }
 
+impl PartialEq for HarmonicSpectrum {
+    fn eq(&self, other: &Self) -> bool {
+        (self.l0_monopole - other.l0_monopole).abs() < f64::EPSILON
+            && (self.l1_dipole - other.l1_dipole).abs() < f64::EPSILON
+            && (self.l2_quadrupole - other.l2_quadrupole).abs() < f64::EPSILON
+    }
+}
+
+impl std::fmt::Display for HarmonicSpectrum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HarmonicSpectrum {{ L0: {:.4}, L1: {:.4}, L2: {:.4} }}",
+            self.l0_monopole, self.l1_dipole, self.l2_quadrupole,
+        )
+    }
+}
+
+impl PartialEq for Tunnel {
+    fn eq(&self, other: &Self) -> bool {
+        self.sphere_a == other.sphere_a
+            && self.sphere_b == other.sphere_b
+            && self.buoy_a_label == other.buoy_a_label
+            && self.buoy_b_label == other.buoy_b_label
+            && (self.overlap - other.overlap).abs() < f64::EPSILON
+            && self.semantic_a == other.semantic_a
+            && self.semantic_b == other.semantic_b
+    }
+}
+
 /// Maximum tunnels to track per tick.
 const TUNNEL_MAX: usize = 100;
 
 /// Complete field state — the cognitive topology of the swarm.
+///
+/// `PartialEq` is implemented manually — `f64` and nested f64-bearing types
+/// prevent a blanket `derive(PartialEq)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldState {
     /// Global order parameter.
@@ -78,6 +114,16 @@ pub struct FieldState {
     pub total_memories: usize,
     /// Current tick count.
     pub tick: u64,
+}
+
+impl PartialEq for FieldState {
+    fn eq(&self, other: &Self) -> bool {
+        (self.order_parameter.r - other.order_parameter.r).abs() < f64::EPSILON
+            && (self.order_parameter.psi - other.order_parameter.psi).abs() < f64::EPSILON
+            && self.sphere_count == other.sphere_count
+            && self.total_memories == other.total_memories
+            && self.tick == other.tick
+    }
 }
 
 impl FieldState {
@@ -116,6 +162,9 @@ impl FieldState {
 // ──────────────────────────────────────────────────────────────
 
 /// Pre-computed decision packet for `/field/decision`.
+///
+/// `PartialEq` is implemented manually — `f64` fields and nested f64-bearing
+/// types prevent a blanket `derive(PartialEq)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDecision {
     /// Recommended action.
@@ -144,6 +193,19 @@ pub struct FieldDecision {
     pub divergence_pressure: f64,
     /// Fleet mode.
     pub fleet_mode: FleetMode,
+}
+
+impl PartialEq for FieldDecision {
+    fn eq(&self, other: &Self) -> bool {
+        self.action == other.action
+            && (self.r - other.r).abs() < f64::EPSILON
+            && self.r_trend == other.r_trend
+            && self.tick == other.tick
+            && self.fleet_mode == other.fleet_mode
+            && (self.coherence_pressure - other.coherence_pressure).abs() < f64::EPSILON
+            && (self.divergence_pressure - other.divergence_pressure).abs() < f64::EPSILON
+            && self.tunnel_count == other.tunnel_count
+    }
 }
 
 impl FieldDecision {
@@ -859,5 +921,110 @@ mod tests {
         let h = compute_harmonics(&phases);
         assert!(h.l1_dipole <= 1.0, "l1_dipole={} must not exceed 1.0", h.l1_dipole);
         assert!(h.l1_dipole >= 0.0);
+    }
+
+    // ── PartialEq on HarmonicSpectrum ──
+
+    #[test]
+    fn harmonic_spectrum_partial_eq_identical() {
+        let h = HarmonicSpectrum {
+            l0_monopole: 0.5,
+            l1_dipole: 0.8,
+            l2_quadrupole: 0.2,
+        };
+        assert_eq!(h, h.clone());
+    }
+
+    #[test]
+    fn harmonic_spectrum_partial_eq_different_l0() {
+        let a = HarmonicSpectrum {
+            l0_monopole: 0.5,
+            l1_dipole: 0.8,
+            l2_quadrupole: 0.2,
+        };
+        let b = HarmonicSpectrum {
+            l0_monopole: 0.6,
+            l1_dipole: 0.8,
+            l2_quadrupole: 0.2,
+        };
+        assert_ne!(a, b);
+    }
+
+    // ── Display on HarmonicSpectrum ──
+
+    #[test]
+    fn harmonic_spectrum_display_contains_labels() {
+        let h = HarmonicSpectrum {
+            l0_monopole: 0.5,
+            l1_dipole: 0.8,
+            l2_quadrupole: 0.2,
+        };
+        let s = format!("{h}");
+        assert!(s.contains("L0"), "display should mention L0");
+        assert!(s.contains("L1"), "display should mention L1");
+        assert!(s.contains("L2"), "display should mention L2");
+    }
+
+    // ── PartialEq on Tunnel ──
+
+    #[test]
+    fn tunnel_partial_eq_identical() {
+        let t = Tunnel {
+            sphere_a: pid("a"),
+            sphere_b: pid("b"),
+            buoy_a_label: "primary".into(),
+            buoy_b_label: "secondary".into(),
+            overlap: 0.75,
+            semantic_a: "Read".into(),
+            semantic_b: "Write".into(),
+        };
+        assert_eq!(t, t.clone());
+    }
+
+    #[test]
+    fn tunnel_partial_eq_different_overlap() {
+        let make_t = |overlap: f64| Tunnel {
+            sphere_a: pid("a"),
+            sphere_b: pid("b"),
+            buoy_a_label: "p".into(),
+            buoy_b_label: "q".into(),
+            overlap,
+            semantic_a: "R".into(),
+            semantic_b: "W".into(),
+        };
+        assert_ne!(make_t(0.5), make_t(0.6));
+    }
+
+    // ── PartialEq on FieldState ──
+
+    #[test]
+    fn field_state_partial_eq_same_tick() {
+        let spheres = HashMap::new();
+        let fs = FieldState::compute(&spheres, 1.0, 42);
+        assert_eq!(fs, fs.clone());
+    }
+
+    #[test]
+    fn field_state_partial_eq_different_tick() {
+        let spheres = HashMap::new();
+        let a = FieldState::compute(&spheres, 1.0, 1);
+        let b = FieldState::compute(&spheres, 1.0, 2);
+        assert_ne!(a, b);
+    }
+
+    // ── PartialEq on FieldDecision ──
+
+    #[test]
+    fn field_decision_partial_eq_recovering_same_tick() {
+        let a = FieldDecision::recovering(10);
+        let b = FieldDecision::recovering(10);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn field_decision_partial_eq_different_tick() {
+        let a = FieldDecision::recovering(10);
+        let b = FieldDecision::recovering(20);
+        assert_ne!(a, b);
     }
 }

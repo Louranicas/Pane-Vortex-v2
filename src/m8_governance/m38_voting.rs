@@ -296,4 +296,118 @@ mod tests {
         let s = VoteSummary::from_votes(&votes, 2, 0.5);
         assert_relative_eq!(s.participation, 1.0);
     }
+
+    // ── Additional coverage: boundary quorum, exact threshold ──
+
+    #[test]
+    fn quorum_exactly_at_threshold_is_met() {
+        // participation = 1/2 = 0.5, threshold = 0.5 → quorum_met = true
+        let votes = vec![Vote { voter: pid("a"), choice: VoteChoice::Approve, tick: 1 }];
+        let s = VoteSummary::from_votes(&votes, 2, 0.5);
+        assert!(s.quorum_met, "participation == threshold must count as quorum met");
+    }
+
+    #[test]
+    fn quorum_just_below_threshold_not_met() {
+        // 1 vote out of 3 → 0.333 < 0.5 → not met
+        let votes = vec![Vote { voter: pid("a"), choice: VoteChoice::Approve, tick: 1 }];
+        let s = VoteSummary::from_votes(&votes, 3, 0.5);
+        assert!(!s.quorum_met, "participation < threshold must not meet quorum");
+    }
+
+    #[test]
+    fn would_approve_false_when_quorum_met_but_reject_majority() {
+        let votes = vec![
+            Vote { voter: pid("a"), choice: VoteChoice::Reject, tick: 1 },
+            Vote { voter: pid("b"), choice: VoteChoice::Reject, tick: 2 },
+            Vote { voter: pid("c"), choice: VoteChoice::Approve, tick: 3 },
+        ];
+        let s = VoteSummary::from_votes(&votes, 3, 0.5); // participation = 1.0
+        assert!(s.quorum_met);
+        assert!(!s.would_approve(), "reject majority must block approval even with quorum");
+    }
+
+    #[test]
+    fn would_approve_false_when_approvals_but_no_quorum() {
+        // Lots of approvals but turnout is too low
+        let votes = vec![
+            Vote { voter: pid("a"), choice: VoteChoice::Approve, tick: 1 },
+            Vote { voter: pid("b"), choice: VoteChoice::Approve, tick: 2 },
+        ];
+        let s = VoteSummary::from_votes(&votes, 100, 0.5); // participation = 0.02
+        assert!(!s.quorum_met);
+        assert!(!s.would_approve(), "no quorum → no approval even with approve majority");
+    }
+
+    // ── VotingHistory: votes_by checks choice values ──
+
+    #[test]
+    fn votes_by_preserves_choice_values() {
+        let mut h = VotingHistory::new();
+        h.record(pid("a"), "p1".into(), VoteChoice::Approve);
+        h.record(pid("a"), "p2".into(), VoteChoice::Abstain);
+        let votes = h.votes_by(&pid("a"));
+        assert_eq!(votes.len(), 2);
+        let choices: Vec<VoteChoice> = votes.iter().map(|(_, c)| *c).collect();
+        assert!(choices.contains(&VoteChoice::Approve));
+        assert!(choices.contains(&VoteChoice::Abstain));
+    }
+
+    #[test]
+    fn votes_by_proposal_id_preserved() {
+        let mut h = VotingHistory::new();
+        h.record(pid("a"), "proposal-xyz".into(), VoteChoice::Reject);
+        let votes = h.votes_by(&pid("a"));
+        assert_eq!(votes[0].0, "proposal-xyz");
+    }
+
+    #[test]
+    fn total_votes_accumulates_across_multiple_spheres() {
+        let mut h = VotingHistory::new();
+        h.record(pid("a"), "p1".into(), VoteChoice::Approve);
+        h.record(pid("a"), "p2".into(), VoteChoice::Approve);
+        h.record(pid("b"), "p1".into(), VoteChoice::Reject);
+        assert_eq!(h.total_votes(), 3);
+    }
+
+    #[test]
+    fn unique_voters_empty_initially() {
+        let h = VotingHistory::new();
+        assert_eq!(h.unique_voters(), 0);
+    }
+
+    #[test]
+    fn summary_quorum_not_met_reject_majority_still_no_approve() {
+        let votes = vec![
+            Vote { voter: pid("a"), choice: VoteChoice::Reject, tick: 1 },
+        ];
+        // 1 of 10 = 10% participation < 50% threshold
+        let s = VoteSummary::from_votes(&votes, 10, 0.5);
+        assert!(!s.quorum_met);
+        assert!(!s.would_approve());
+    }
+
+    #[test]
+    fn from_votes_all_reject_no_approve() {
+        let votes = vec![
+            Vote { voter: pid("a"), choice: VoteChoice::Reject, tick: 1 },
+            Vote { voter: pid("b"), choice: VoteChoice::Reject, tick: 2 },
+        ];
+        let s = VoteSummary::from_votes(&votes, 2, 0.5);
+        assert_eq!(s.approve, 0);
+        assert_eq!(s.reject, 2);
+        assert!(!s.would_approve());
+    }
+
+    #[test]
+    fn from_votes_all_abstain_no_approve() {
+        let votes = vec![
+            Vote { voter: pid("a"), choice: VoteChoice::Abstain, tick: 1 },
+            Vote { voter: pid("b"), choice: VoteChoice::Abstain, tick: 2 },
+        ];
+        let s = VoteSummary::from_votes(&votes, 2, 0.5);
+        assert_eq!(s.abstain, 2);
+        assert_eq!(s.approve, 0);
+        assert!(!s.would_approve());
+    }
 }

@@ -1,7 +1,9 @@
 //! # M32: Executor
 //!
-//! Thin Zellij dispatch. 5-step: identify target -> navigate tab -> verify pane ->
-//! send command -> return. Pane mapping from fleet inventory.
+//! Task dispatcher: select target sphere from fleet inventory using one of four
+//! `TaskTarget` strategies (`Specific`, `AnyIdle`, `FieldDriven`, `Willing`), then record
+//! the dispatch in a bounded queue. Actual Zellij tab navigation and pane focus
+//! are handled by the binary layer, not this module.
 //!
 //! ## Layer: L7 | Module: M32 | Dependencies: L1, L3 (M11, M12)
 
@@ -68,7 +70,7 @@ impl ExecutorResult {
 /// Actual Zellij dispatch (tab navigation, pane focus) is done by the binary.
 #[derive(Debug)]
 pub struct Executor {
-    /// Dispatch queue (task IDs waiting for dispatch).
+    /// Dispatch queue: `PaneId` of each successfully dispatched target, in dispatch order.
     dispatch_queue: Vec<PaneId>,
     /// Maximum queue depth.
     max_queue: usize,
@@ -174,7 +176,10 @@ impl Executor {
         self.dispatch_queue.clear();
     }
 
-    /// Recent dispatch targets (from the queue).
+    /// Most recent dispatch targets, newest first (up to `n` entries).
+    ///
+    /// Returns at most `n` entries from the tail of the dispatch queue, ordered
+    /// from most recent to least recent.
     #[must_use]
     #[allow(dead_code)] // Dispatch history for debugging and API inspection
     pub(crate) fn recent_dispatches(&self, n: usize) -> Vec<&PaneId> {

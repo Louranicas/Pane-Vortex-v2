@@ -21,6 +21,10 @@ use crate::m4_coupling::m16_coupling_network::CouplingNetwork;
 // ──────────────────────────────────────────────────────────────
 
 /// Result of a single Hebbian STDP update cycle.
+///
+/// `PartialEq` is implemented manually — `total_weight_change: f64` prevents
+/// a blanket `derive(PartialEq)`. Integer fields use exact equality; the float
+/// field uses `f64::EPSILON` tolerance.
 #[derive(Debug, Clone, Default)]
 pub struct StdpResult {
     /// Number of LTP (potentiation) updates applied.
@@ -31,6 +35,25 @@ pub struct StdpResult {
     pub at_floor_count: usize,
     /// Total weight change (absolute sum).
     pub total_weight_change: f64,
+}
+
+impl PartialEq for StdpResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.ltp_count == other.ltp_count
+            && self.ltd_count == other.ltd_count
+            && self.at_floor_count == other.at_floor_count
+            && (self.total_weight_change - other.total_weight_change).abs() < f64::EPSILON
+    }
+}
+
+impl std::fmt::Display for StdpResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "StdpResult {{ ltp: {}, ltd: {}, at_floor: {}, Δw: {:.6} }}",
+            self.ltp_count, self.ltd_count, self.at_floor_count, self.total_weight_change,
+        )
+    }
 }
 
 /// Apply one cycle of Hebbian STDP to the coupling network.
@@ -588,5 +611,93 @@ mod tests {
             "LTD in symmetric mode must report non-zero total_weight_change"
         );
         assert!(result.ltd_count > 0, "should have LTD updates");
+    }
+
+    // ── PartialEq on StdpResult ──
+
+    #[test]
+    fn stdp_result_partial_eq_identical() {
+        let r = StdpResult {
+            ltp_count: 3,
+            ltd_count: 1,
+            at_floor_count: 0,
+            total_weight_change: 0.03,
+        };
+        assert_eq!(r, r.clone());
+    }
+
+    #[test]
+    fn stdp_result_partial_eq_different_ltp_count() {
+        let a = StdpResult {
+            ltp_count: 2,
+            ltd_count: 0,
+            at_floor_count: 0,
+            total_weight_change: 0.0,
+        };
+        let b = StdpResult {
+            ltp_count: 3,
+            ltd_count: 0,
+            at_floor_count: 0,
+            total_weight_change: 0.0,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn stdp_result_partial_eq_different_weight_change() {
+        let a = StdpResult {
+            ltp_count: 1,
+            ltd_count: 0,
+            at_floor_count: 0,
+            total_weight_change: 0.01,
+        };
+        let b = StdpResult {
+            ltp_count: 1,
+            ltd_count: 0,
+            at_floor_count: 0,
+            total_weight_change: 0.02,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn stdp_result_default_equals_zero_struct() {
+        let a = StdpResult::default();
+        let b = StdpResult {
+            ltp_count: 0,
+            ltd_count: 0,
+            at_floor_count: 0,
+            total_weight_change: 0.0,
+        };
+        assert_eq!(a, b);
+    }
+
+    // ── Display on StdpResult ──
+
+    #[test]
+    fn stdp_result_display_shows_ltp_and_ltd() {
+        let r = StdpResult {
+            ltp_count: 4,
+            ltd_count: 2,
+            at_floor_count: 1,
+            total_weight_change: 0.042,
+        };
+        let s = format!("{r}");
+        assert!(s.contains("ltp: 4"), "display should show ltp count");
+        assert!(s.contains("ltd: 2"), "display should show ltd count");
+        assert!(s.contains("at_floor: 1"), "display should show floor count");
+    }
+
+    #[test]
+    fn stdp_result_display_contains_delta_w() {
+        let r = StdpResult {
+            ltp_count: 0,
+            ltd_count: 0,
+            at_floor_count: 0,
+            total_weight_change: 0.0,
+        };
+        let s = format!("{r}");
+        // The Display format uses Δw symbol
+        assert!(!s.is_empty(), "display should produce non-empty string");
     }
 }

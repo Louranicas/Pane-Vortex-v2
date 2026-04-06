@@ -508,4 +508,140 @@ mod tests {
             "HalfOpen must not linger after probe failure regardless of count"
         );
     }
+
+    // ── Additional coverage: open circuit within recovery window ──
+
+    #[test]
+    fn should_not_check_when_open_and_recently_failed() {
+        let mut h = ServiceHealth::new("test");
+        // Open the circuit
+        for _ in 0..CIRCUIT_OPEN_THRESHOLD {
+            h.record_failure(0);
+        }
+        assert_eq!(h.circuit_state, CircuitState::Open);
+        // last_checked was just set by record_failure — well within 60s window
+        assert!(
+            !h.should_check(),
+            "open circuit with recent failure should not allow check within recovery window"
+        );
+    }
+
+    #[test]
+    fn staleness_secs_after_success_is_finite() {
+        let mut h = ServiceHealth::new("test");
+        h.record_success(200);
+        let staleness = h.staleness_secs();
+        assert!(
+            staleness.is_finite(),
+            "staleness must be finite after a successful check"
+        );
+        assert!(staleness >= 0.0, "staleness must be non-negative");
+    }
+
+    #[test]
+    fn try_half_open_noop_when_already_half_open() {
+        let mut h = ServiceHealth::new("test");
+        for _ in 0..CIRCUIT_OPEN_THRESHOLD {
+            h.record_failure(0);
+        }
+        h.try_half_open();
+        assert_eq!(h.circuit_state, CircuitState::HalfOpen);
+        // Calling again should not change state (no-op on non-Open)
+        h.try_half_open();
+        assert_eq!(
+            h.circuit_state,
+            CircuitState::HalfOpen,
+            "try_half_open must be a no-op when already HalfOpen"
+        );
+    }
+
+    // ── Additional HealthMonitor coverage ──
+
+    #[test]
+    fn initialize_idempotent_does_not_duplicate() {
+        let mut m = HealthMonitor::new();
+        m.initialize(&["svc1"]);
+        m.initialize(&["svc1"]); // second call must not reset existing state
+        assert_eq!(m.records.len(), 1, "duplicate initialize must not create duplicate entries");
+    }
+
+    #[test]
+    fn initialize_preserves_existing_state() {
+        let mut m = HealthMonitor::new();
+        m.initialize(&["svc1"]);
+        m.record("svc1", true, 200); // mark healthy
+        m.initialize(&["svc1"]); // re-initialize must not reset
+        assert!(
+            m.get("svc1").unwrap().healthy,
+            "re-initializing must not overwrite existing record"
+        );
+    }
+
+    #[test]
+    fn record_creates_entry_for_unknown_service() {
+        let mut m = HealthMonitor::new();
+        // No prior initialize — record must create the entry
+        m.record("new-svc", true, 200);
+        assert!(m.get("new-svc").is_some(), "record must create entry for unknown service");
+        assert!(m.get("new-svc").unwrap().healthy);
+    }
+
+    #[test]
+    fn unhealthy_count_zero_when_all_healthy() {
+        let mut m = HealthMonitor::new();
+        m.record("svc1", true, 200);
+        m.record("svc2", true, 200);
+        assert_eq!(m.unhealthy_count(), 0);
+    }
+
+    #[test]
+    fn healthy_count_zero_when_all_unhealthy() {
+        let mut m = HealthMonitor::new();
+        m.record("svc1", false, 503);
+        m.record("svc2", false, 503);
+        assert_eq!(m.healthy_count(), 0);
+    }
+
+    #[test]
+    fn summary_contains_open_circuit_count() {
+        let mut m = HealthMonitor::new();
+        for _ in 0..CIRCUIT_OPEN_THRESHOLD {
+            m.record("svc1", false, 0);
+        }
+        let s = m.summary();
+        assert!(
+            s.contains("1 open circuits"),
+            "summary must report open circuit count, got: {s}"
+        );
+    }
+
+    #[test]
+    fn record_failure_status_code_stored() {
+        let mut h = ServiceHealth::new("test");
+        h.record_failure(503);
+        assert_eq!(h.last_status, 503);
+    }
+
+    #[test]
+    fn record_success_updates_last_checked() {
+        let mut h = ServiceHealth::new("test");
+        assert_eq!(h.last_checked, 0.0);
+        h.record_success(200);
+        assert!(h.last_checked > 0.0, "last_checked must be updated on success");
+        assert!(h.last_success > 0.0, "last_success must be updated on success");
+    }
+
+    #[test]
+    fn consecutive_failures_below_threshold_stays_closed() {
+        let mut h = ServiceHealth::new("test");
+        // One less than threshold
+        for _ in 0..(CIRCUIT_OPEN_THRESHOLD - 1) {
+            h.record_failure(0);
+        }
+        assert_eq!(
+            h.circuit_state,
+            CircuitState::Closed,
+            "circuit must stay closed until threshold is reached"
+        );
+    }
 }

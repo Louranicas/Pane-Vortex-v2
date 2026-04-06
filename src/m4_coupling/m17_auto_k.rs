@@ -18,6 +18,9 @@ use super::m16_coupling_network::CouplingNetwork;
 ///
 /// Tracks when to recalculate K and applies smoothing to prevent
 /// sudden coupling strength changes.
+///
+/// `PartialEq` is implemented manually — `f64` fields (`previous_k`,
+/// `smoothing`) prevent a blanket `derive(PartialEq)`.
 #[derive(Debug, Clone)]
 pub struct AutoKController {
     /// Ticks since last recalculation.
@@ -103,6 +106,28 @@ impl AutoKController {
 impl Default for AutoKController {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl PartialEq for AutoKController {
+    fn eq(&self, other: &Self) -> bool {
+        self.ticks_since_recalc == other.ticks_since_recalc
+            && self.period == other.period
+            && (self.previous_k - other.previous_k).abs() < f64::EPSILON
+            && (self.smoothing - other.smoothing).abs() < f64::EPSILON
+    }
+}
+
+impl std::fmt::Display for AutoKController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "AutoKController {{ period: {}, ticks_remaining: {}, previous_k: {:.4}, smoothing: {:.3} }}",
+            self.period,
+            self.ticks_remaining(),
+            self.previous_k,
+            self.smoothing,
+        )
     }
 }
 
@@ -360,5 +385,55 @@ mod tests {
         }
 
         assert_eq!(recalc_count, 10); // 30/3 = 10 recalculations
+    }
+
+    // ── PartialEq on AutoKController ──
+
+    #[test]
+    fn auto_k_controller_partial_eq_new_instances_match() {
+        let a = AutoKController::new();
+        let b = AutoKController::new();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn auto_k_controller_partial_eq_different_period() {
+        let a = AutoKController::with_params(5, 0.3);
+        let b = AutoKController::with_params(10, 0.3);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn auto_k_controller_partial_eq_different_smoothing() {
+        let a = AutoKController::with_params(5, 0.2);
+        let b = AutoKController::with_params(5, 0.4);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn auto_k_controller_partial_eq_after_tick_differs() {
+        let mut a = AutoKController::with_params(10, 0.3);
+        let b = AutoKController::with_params(10, 0.3);
+        let mut net = CouplingNetwork::new();
+        a.tick(&mut net);
+        // After a tick ticks_since_recalc differs → not equal
+        assert_ne!(a, b);
+    }
+
+    // ── Display on AutoKController ──
+
+    #[test]
+    fn auto_k_controller_display_shows_period() {
+        let ctrl = AutoKController::with_params(7, 0.25);
+        let s = format!("{ctrl}");
+        assert!(s.contains("period: 7"), "display should show period");
+    }
+
+    #[test]
+    fn auto_k_controller_display_shows_smoothing() {
+        let ctrl = AutoKController::with_params(5, 0.30);
+        let s = format!("{ctrl}");
+        assert!(s.contains("smoothing"), "display should mention smoothing");
+        assert!(s.contains("0.300"));
     }
 }

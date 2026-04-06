@@ -382,4 +382,107 @@ mod tests {
         let c: ConsentDeclaration = serde_json::from_str(json).unwrap();
         assert!(!c.is_revoked(), "missing revoked_at_tick must default to None");
     }
+
+    // ── Additional coverage: per-type routing when individual flags differ ──
+
+    #[test]
+    fn accepts_coupling_defaults_to_modulation() {
+        // "coupling" is not an explicit match arm — falls through to accept_modulation
+        let c = ConsentDeclaration::fully_open(pid("a"), 10);
+        assert!(c.accepts("coupling"), "coupling must follow accept_modulation");
+    }
+
+    #[test]
+    fn closed_rejects_coupling() {
+        let c = ConsentDeclaration::fully_closed(pid("a"), 10);
+        assert!(!c.accepts("coupling"), "closed declaration must reject coupling");
+    }
+
+    #[test]
+    fn accepts_dispatch_follows_cascade_flag() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.accept_cascade = false;
+        assert!(
+            !c.accepts("dispatch"),
+            "dispatch must follow accept_cascade when false"
+        );
+    }
+
+    #[test]
+    fn accepts_analytics_follows_observation_flag() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.accept_observation = false;
+        assert!(
+            !c.accepts("analytics"),
+            "analytics must follow accept_observation when false"
+        );
+    }
+
+    #[test]
+    fn accepts_evolution_follows_observation_flag() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.accept_observation = false;
+        assert!(
+            !c.accepts("evolution"),
+            "evolution must follow accept_observation when false"
+        );
+    }
+
+    #[test]
+    fn accepts_nvim_monitoring_follows_nvim_flag() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.accept_nvim_monitoring = false;
+        assert!(
+            !c.accepts("nvim_monitoring"),
+            "nvim_monitoring must follow accept_nvim_monitoring when false"
+        );
+    }
+
+    #[test]
+    fn accepts_reasoning_memory_follows_rm_flag() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.accept_rm_logging = false;
+        assert!(
+            !c.accepts("reasoning_memory"),
+            "reasoning_memory must follow accept_rm_logging when false"
+        );
+    }
+
+    #[test]
+    fn accepts_unknown_when_modulation_false() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.accept_modulation = false;
+        assert!(
+            !c.accepts("totally_unknown_type"),
+            "unknown modulation type must respect accept_modulation=false"
+        );
+    }
+
+    #[test]
+    fn acceptance_count_one_flag_true() {
+        let mut c = ConsentDeclaration::fully_closed(pid("a"), 10);
+        c.accept_modulation = true;
+        assert_eq!(c.acceptance_count(), 1);
+    }
+
+    #[test]
+    fn acceptance_count_four_flags() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.accept_rm_logging = false;
+        assert_eq!(c.acceptance_count(), 4);
+    }
+
+    #[test]
+    fn revoke_on_closed_declaration_sets_revoked_flag() {
+        let mut c = ConsentDeclaration::fully_closed(pid("a"), 10);
+        c.revoke(20);
+        assert!(c.is_revoked());
+        assert_eq!(c.revoked_at_tick, Some(20));
+    }
+
+    #[test]
+    fn fully_open_declared_at_tick_zero() {
+        let c = ConsentDeclaration::fully_open(pid("a"), 0);
+        assert_eq!(c.declared_at_tick, 0);
+    }
 }
