@@ -177,7 +177,12 @@ fn find_gaps(sorted: &[(PaneId, f64)], threshold: f64) -> Vec<usize> {
     for i in 0..n {
         let next = (i + 1) % n;
         let gap = if next == 0 {
-            (sorted[0].1 + TAU - sorted[n - 1].1).rem_euclid(TAU)
+            // F06: wrap-around gap from last sorted phase back to first (going forward
+            // past 2π). Sorted phases are in [0, TAU) so this value is in (0, TAU].
+            // Do NOT apply rem_euclid(TAU): if all phases equal 0.0, the wrap gap is
+            // exactly TAU; rem_euclid would map it to 0.0, suppressing the gap and
+            // producing a false single-cluster result.
+            sorted[0].1 + TAU - sorted[n - 1].1
         } else {
             sorted[next].1 - sorted[i].1
         };
@@ -683,5 +688,36 @@ mod tests {
         }
         let c = ChimeraState::detect(&phases, 1.0);
         assert!(c.cluster_count() >= 2);
+    }
+
+    // ── Numerical stability regression tests (F06) ──
+
+    /// F06: All phases identical — wrap-around gap is exactly TAU.
+    /// Without the fix, rem_euclid(TAU) maps TAU → 0.0, suppressing the gap
+    /// and returning a single cluster when two clusters are expected.
+    #[test]
+    fn find_gaps_wrap_around_not_zeroed_when_gap_is_tau() {
+        // Two spheres both at 0.0: wrap-around gap = 0.0 + TAU - 0.0 = TAU.
+        // TAU > any reasonable threshold, so ONE gap should be detected
+        // (meaning the two identical phases form one cluster, with a single wrap gap).
+        let sorted = vec![
+            (PaneId::new("a"), 0.0_f64),
+            (PaneId::new("b"), 0.0_f64),
+        ];
+        let gaps = find_gaps(&sorted, FRAC_PI_3);
+        // Wrap gap = TAU ≈ 6.28 > π/3: there should be exactly one gap recorded
+        // (the wrap-around gap from b back to a).
+        assert!(!gaps.is_empty(), "wrap-around gap of TAU must not be zeroed by rem_euclid");
+    }
+
+    /// F06: Ensure the full-circle wrap gap does not cause panic or phantom cluster.
+    #[test]
+    fn wrap_gap_exactly_tau_produces_valid_cluster_detection() {
+        let mut phases = HashMap::new();
+        phases.insert(PaneId::new("a"), 0.0_f64);
+        phases.insert(PaneId::new("b"), 0.0_f64);
+        // Should not panic and should return a valid (possibly single-cluster) state
+        let c = ChimeraState::detect(&phases, 1.0);
+        assert!(!c.is_chimera, "two spheres at same phase cannot be a chimera");
     }
 }

@@ -253,7 +253,9 @@ fn compute_order_parameter(phases: &HashMap<PaneId, f64>) -> OrderParameter {
 
     #[allow(clippy::cast_precision_loss)]
     let n = phases.len() as f64;
-    let r = (re / n).hypot(im / n);
+    // F01: clamp to [0.0, 1.0] — fp accumulation can push hypot above 1.0 after
+    // millions of ticks. r > 1.0 is unphysical and corrupts compute_pressures().
+    let r = (re / n).hypot(im / n).clamp(0.0, 1.0);
     let psi = (im / n).atan2(re / n).rem_euclid(TAU);
 
     OrderParameter { r, psi }
@@ -276,7 +278,7 @@ fn compute_harmonics(phases: &HashMap<PaneId, f64>) -> HarmonicSpectrum {
         .values()
         .map(|&phi| (phi.cos(), phi.sin()))
         .fold((0.0, 0.0), |(ar, ai), (r, i)| (ar + r, ai + i));
-    let l1 = (re / n).hypot(im / n);
+    let l1 = (re / n).hypot(im / n).clamp(0.0, 1.0); // F01: same reason as r
 
     // L=2: quadrupole (cos(2*phi) average)
     let l2 = phases.values().map(|phi| (2.0 * phi).cos()).sum::<f64>() / n;
@@ -828,5 +830,34 @@ mod tests {
         if fd.tunnel_count > 0 {
             assert!(fd.strongest_tunnel.is_some());
         }
+    }
+
+    // ── Numerical stability regression tests (F01) ──
+
+    /// F01: order parameter r must never exceed 1.0 regardless of phase distribution.
+    #[test]
+    fn order_parameter_r_bounded_above_by_one() {
+        let mut phases = HashMap::new();
+        // Pack 100 oscillators at nearly identical phases to maximise r
+        for i in 0..100 {
+            let phase = 1e-10 * i as f64;
+            phases.insert(pid(&format!("s{i}")), phase);
+        }
+        let op = compute_order_parameter(&phases);
+        assert!(op.r <= 1.0, "r={} must not exceed 1.0", op.r);
+        assert!(op.r >= 0.0, "r must be non-negative");
+    }
+
+    /// F01: harmonics l1_dipole is bounded by [0, 1].
+    #[test]
+    fn harmonics_l1_dipole_bounded() {
+        let mut phases = HashMap::new();
+        for i in 0..100 {
+            let phase = 1e-12 * i as f64;
+            phases.insert(pid(&format!("s{i}")), phase);
+        }
+        let h = compute_harmonics(&phases);
+        assert!(h.l1_dipole <= 1.0, "l1_dipole={} must not exceed 1.0", h.l1_dipole);
+        assert!(h.l1_dipole >= 0.0);
     }
 }

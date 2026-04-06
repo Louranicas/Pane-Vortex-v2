@@ -26,6 +26,7 @@ use crate::m4_coupling::m16_coupling_network::CouplingNetwork;
 const DIVERGENCE_COOLDOWN_TICKS: u32 = 3;
 
 /// Minimum sphere count for emergent breathing to be meaningful.
+#[allow(dead_code)] // Used in emergent_breathing (pub(crate), not yet wired to callers)
 const MIN_SPHERES_FOR_EMERGENT: usize = 3;
 
 /// Phase noise strength for divergence kicks.
@@ -54,6 +55,7 @@ pub struct Conductor {
     /// Proportional gain for the PI controller.
     gain: f64,
     /// Fraction of emergent signal blended into output (0.0–1.0).
+    #[allow(dead_code)] // Read by breathing_blend() accessor (pub(crate)), wired to tick in future pass
     breathing_blend: f64,
 }
 
@@ -69,7 +71,8 @@ impl Conductor {
 
     /// Create a conductor with custom gain and blend parameters.
     #[must_use]
-    pub fn with_params(gain: f64, breathing_blend: f64) -> Self {
+    #[allow(dead_code)] // Test helper + future tuning API
+    pub(crate) fn with_params(gain: f64, breathing_blend: f64) -> Self {
         Self {
             gain: gain.clamp(0.01, 1.0),
             breathing_blend: breathing_blend.clamp(0.0, 1.0),
@@ -198,7 +201,8 @@ impl Conductor {
     /// the variance of phase velocities — a proxy for collective rhythm.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
-    pub fn emergent_breathing(network: &CouplingNetwork, tick: u64) -> f64 {
+    #[allow(dead_code)] // Emergent signal API; wired into tick_conductor breathing blend in future pass
+    pub(crate) fn emergent_breathing(network: &CouplingNetwork, tick: u64) -> f64 {
         let n = network.sphere_count();
         if n < MIN_SPHERES_FOR_EMERGENT {
             return 0.0;
@@ -253,13 +257,15 @@ impl Conductor {
 
     /// Get the current gain.
     #[must_use]
-    pub const fn gain(&self) -> f64 {
+    #[allow(dead_code)] // Accessor for conductor configuration inspection
+    pub(crate) const fn gain(&self) -> f64 {
         self.gain
     }
 
     /// Get the current breathing blend.
     #[must_use]
-    pub const fn breathing_blend(&self) -> f64 {
+    #[allow(dead_code)] // Accessor for breathing blend ratio; used in with_params tests
+    pub(crate) const fn breathing_blend(&self) -> f64 {
         self.breathing_blend
     }
 }

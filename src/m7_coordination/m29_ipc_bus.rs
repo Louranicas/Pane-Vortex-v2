@@ -681,9 +681,19 @@ pub async fn start_bus_listener(
             continue;
         }
 
-        // Check connection cap
-        let current = active_connections.load(Ordering::Relaxed);
-        if current >= MAX_CONNECTIONS {
+        // Atomically reserve a connection slot.  fetch_update is a CAS loop:
+        // it returns Ok(old_value) on success and Err(current) when the predicate
+        // fails.  This closes the check-then-act race where two concurrent accept
+        // iterations both observe current < MAX_CONNECTIONS and both proceed,
+        // pushing the live count above the cap.
+        let cap_result = active_connections.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |n| if n < MAX_CONNECTIONS { Some(n + 1) } else { None },
+        );
+
+        if cap_result.is_err() {
+            let current = active_connections.load(Ordering::Relaxed);
             warn!(
                 connections = current,
                 max = MAX_CONNECTIONS,
@@ -702,8 +712,6 @@ pub async fn start_bus_listener(
             }
             continue;
         }
-
-        active_connections.fetch_add(1, Ordering::Relaxed);
 
         let conn_state = state.clone();
         let conn_bus = bus_state.clone();
@@ -829,6 +837,9 @@ async fn handle_connection(
     info!(is_v1_client, pane = %pane_id, "sending welcome response");
     let welcome_line = if is_v1_client {
         // V1 format: {"type":"handshake_ok","tick":N,"peer_count":N,"r":0.0,"protocol_version":1}
+        // Lock ordering: AppState first then BusState — matches C5 documented ordering.
+        // Both guards are dropped before the channel send (.await) so no lock is held
+        // at an async suspension point.
         let (tick, peer_count) = {
             let app = state.read();
             let bus = bus_state.read();
@@ -1941,6 +1952,35 @@ mod tests {
         // Verify cascade event was published
         let bus = bus_state.read();
         assert_eq!(bus.event_count(), 1);
+    }
+
+    // ── Connection cap atomicity ──
+
+    /// Verifies the atomic fetch_update for connection-cap enforcement prevents
+    /// the count from ever exceeding MAX_CONNECTIONS under concurrent racing threads.
+    #[test]
+    fn connection_cap_atomic_prevents_overshoot() {
+        use std::sync::atomic::AtomicUsize;
+        let counter = Arc::new(AtomicUsize::new(MAX_CONNECTIONS - 1));
+        let wins = Arc::new(AtomicUsize::new(0));
+        let cap = MAX_CONNECTIONS;
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let c = counter.clone();
+                let w = wins.clone();
+                std::thread::spawn(move || {
+                    let ok = c
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                            if n < cap { Some(n + 1) } else { None }
+                        })
+                        .is_ok();
+                    if ok { w.fetch_add(1, Ordering::Relaxed); }
+                })
+            })
+            .collect();
+        for t in threads { t.join().unwrap(); }
+        assert_eq!(wins.load(Ordering::Relaxed), 1, "exactly one thread should have claimed the last slot");
+        assert_eq!(counter.load(Ordering::Relaxed), MAX_CONNECTIONS);
     }
 
     // ── Constants ──

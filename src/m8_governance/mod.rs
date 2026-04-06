@@ -20,3 +20,10 @@ pub use m37_proposals::{
 pub use m38_voting::{VoteSummary, VotingHistory};
 pub use m39_consent_declaration::ConsentDeclaration;
 pub use m40_data_sovereignty::{DataManifest, ForgetRequest, ForgetStatus};
+
+// Evolution chamber (feature-gated)
+#[cfg(feature = "evolution")]
+pub use m41_evolution_chamber::{
+    EmergenceEvent, EmergenceType, EvolutionChamber, EvolutionSummary, FieldObservation,
+    FieldPattern, PatternType,
+};

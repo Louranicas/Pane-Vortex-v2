@@ -38,6 +38,12 @@ pub struct ConsentDeclaration {
     pub accept_rm_logging: bool,
     /// Tick at which this declaration was made.
     pub declared_at_tick: u64,
+    /// Tick at which all consent was formally revoked, if any.
+    ///
+    /// A `Some` value means the sphere has withdrawn consent. The tick
+    /// provides an auditable timestamp of the revocation event.
+    #[serde(default)]
+    pub revoked_at_tick: Option<u64>,
 }
 
 impl ConsentDeclaration {
@@ -53,6 +59,7 @@ impl ConsentDeclaration {
             accept_nvim_monitoring: true,
             accept_rm_logging: true,
             declared_at_tick: tick,
+            revoked_at_tick: None,
         }
     }
 
@@ -68,12 +75,39 @@ impl ConsentDeclaration {
             accept_nvim_monitoring: false,
             accept_rm_logging: false,
             declared_at_tick: tick,
+            revoked_at_tick: None,
         }
     }
 
+    /// Formally revoke all consent at the given tick.
+    ///
+    /// Records the revocation tick for audit purposes. Once revoked,
+    /// `is_revoked()` returns `true`. Calling `revoke` again when already
+    /// revoked is a no-op (the original revocation tick is preserved).
+    pub fn revoke(&mut self, tick: u64) {
+        if self.revoked_at_tick.is_none() {
+            self.revoked_at_tick = Some(tick);
+        }
+    }
+
+    /// Whether this declaration has been formally revoked.
+    ///
+    /// Callers must check `is_revoked()` as the definitive gate before
+    /// relying on individual `accept_*` fields.
+    #[must_use]
+    pub const fn is_revoked(&self) -> bool {
+        self.revoked_at_tick.is_some()
+    }
+
     /// Whether this sphere accepts a specific kind of modulation.
+    ///
+    /// Returns `false` if the declaration has been revoked. Unknown modulation
+    /// type strings default to `self.accept_modulation`.
     #[must_use]
     pub fn accepts(&self, modulation_type: &str) -> bool {
+        if self.is_revoked() {
+            return false;
+        }
         match modulation_type {
             "cascade" | "dispatch" => self.accept_cascade,
             "observation" | "analytics" | "evolution" => self.accept_observation,
@@ -280,11 +314,72 @@ mod tests {
         assert_eq!(c.declared_at_tick, 999);
     }
 
-    // ── Sphere ID ──
+    // -- Sphere ID --
 
     #[test]
     fn sphere_id_preserved() {
         let c = ConsentDeclaration::fully_open(pid("my-sphere"), 10);
         assert_eq!(c.sphere_id.as_str(), "my-sphere");
+    }
+
+    // -- FINDING-12: Revocation mechanism --
+
+    #[test]
+    fn not_revoked_by_default() {
+        let c = ConsentDeclaration::fully_open(pid("a"), 10);
+        assert!(!c.is_revoked());
+        assert!(c.revoked_at_tick.is_none());
+    }
+
+    #[test]
+    fn revoke_sets_flag() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.revoke(50);
+        assert!(c.is_revoked());
+        assert_eq!(c.revoked_at_tick, Some(50));
+    }
+
+    #[test]
+    fn revoke_idempotent_preserves_first_tick() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.revoke(50);
+        c.revoke(99);
+        assert_eq!(c.revoked_at_tick, Some(50), "revocation tick must not be overwritten");
+    }
+
+    #[test]
+    fn accepts_returns_false_when_revoked() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.revoke(50);
+        assert!(!c.accepts("modulation"));
+        assert!(!c.accepts("cascade"));
+        assert!(!c.accepts("observation"));
+        assert!(!c.accepts("nvim"));
+        assert!(!c.accepts("rm"));
+        assert!(!c.accepts("unknown_type"));
+    }
+
+    #[test]
+    fn closed_declaration_not_revoked_initially() {
+        let c = ConsentDeclaration::fully_closed(pid("a"), 10);
+        assert!(!c.is_revoked());
+    }
+
+    #[test]
+    fn revoke_serde_roundtrip() {
+        let mut c = ConsentDeclaration::fully_open(pid("a"), 10);
+        c.revoke(77);
+        let json = serde_json::to_string(&c).unwrap();
+        let back: ConsentDeclaration = serde_json::from_str(&json).unwrap();
+        assert!(back.is_revoked());
+        assert_eq!(back.revoked_at_tick, Some(77));
+    }
+
+    #[test]
+    fn revoked_at_tick_none_serde_roundtrip() {
+        // Older snapshots without revoked_at_tick must deserialize via #[serde(default)]
+        let json = r#"{"sphere_id":"test","accept_modulation":true,"max_k_adj":0.15,"accept_cascade":true,"accept_observation":true,"accept_nvim_monitoring":true,"accept_rm_logging":true,"declared_at_tick":10}"#;
+        let c: ConsentDeclaration = serde_json::from_str(json).unwrap();
+        assert!(!c.is_revoked(), "missing revoked_at_tick must default to None");
     }
 }

@@ -5,7 +5,21 @@
 //!
 //! ## Layer: L2 (Services)
 //! ## Module: M10
-//! ## Dependencies: L1 (M02, M03, M06), L3 (M15 `SharedState`), L4 (M16, M18), L7 (M29, M30)
+//! ## Dependencies: L1 (M02, M03, M06), L3 (M15 `SharedState`), L4 (M16, M18), L7 (M29, M30, M33)
+//!
+//! ## Architectural Note: Intentional L2→L7 Cross-Layer Import
+//!
+//! `m10_api_server` is the HTTP gateway for the entire field system. Its handlers
+//! expose bus, cascade, and conductor state as API endpoints, which structurally
+//! requires importing L7 types (`BusState`, `BusTask`, `TaskTarget`, `CascadeTracker`).
+//!
+//! This cross-layer dependency is **intentional and bounded**: the module is entirely
+//! feature-gated (`#[cfg(feature = "api")]`), so the violation only exists when the
+//! `api` feature is enabled. The imports are read-only consumers of L7 data types —
+//! they do not invoke L7 logic (no tick orchestration, no conductor invocation).
+//!
+//! Governance (`m8_governance`) imports inside handler bodies are all
+//! `#[cfg(feature = "governance")]` gated.
 //!
 //! ## Route Groups (36 total)
 //!
@@ -19,7 +33,7 @@
 //! | Bus | 9 | `/bus/info`, tasks, events, submit, claim, complete, fail, cascade, cascades |
 //! | Bridges | 1 | `/bridges/health` |
 //!
-//! ## Audit Fixes (Agent-1, Session 089)
+//! ## Audit Fixes (Agent-1 and Agent-4, Session 089)
 //! - BUG-02/BUG-05: TOCTOU race in `register_handler` — existence check,
 //!   ghost-accept, and sphere insertion now occur in a single write-lock block,
 //!   preventing concurrent registrations from bypassing the existence check.
@@ -29,6 +43,9 @@
 //!   `PvError::SphereNotFound` for task-not-found — fixed to `PvError::BusTaskNotFound`.
 //! - BUG-04: Governance `propose_handler` used `unwrap_or` on `strip_prefix` —
 //!   replaced with `map_or` for clarity.
+//! - Agent-4: Bind variable mismatch in `deregister_handler` — `let ghost = {`
+//!   binding corrected to `let (total_steps, mem_count) = {` to match tuple return.
+//! - Agent-4: All deep-path L7/L8 imports consolidated to layer re-export paths.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -60,9 +77,7 @@ use crate::m3_field::m15_app_state::SharedState;
 use crate::m3_field::{m11_sphere::PaneSphere, m12_field_state::FieldState};
 use crate::m4_coupling::m16_coupling_network::CouplingNetwork;
 use crate::m4_coupling::m18_topology::neighbors;
-use crate::m7_coordination::m29_ipc_bus::BusState;
-use crate::m7_coordination::m30_bus_types::{BusTask, TaskTarget};
-use crate::m7_coordination::m33_cascade::CascadeTracker;
+use crate::m7_coordination::{BusState, BusTask, CascadeTracker, TaskTarget};
 
 // ──────────────────────────────────────────────────────────────
 // AppContext — multi-state extractor
@@ -517,6 +532,9 @@ async fn register_handler(
     // TOCTOU fix: check, ghost-accept, and insert in a single write-lock block
     // to prevent a concurrent registration slipping between the existence check
     // and the insertion.
+    // Clone pid once for network registration below; body.persona is moved into PaneSphere
+    // then referenced directly in response JSON (no double clone).
+    let pid_for_net = pid.clone();
     let mut sphere = PaneSphere::new(pid.clone(), body.persona.clone(), freq)?;
 
     let (ghost_restored, initial_phase) = {
@@ -536,7 +554,8 @@ async fn register_handler(
             false
         };
         let phase = sphere.phase;
-        guard.spheres.insert(pid.clone(), sphere);
+        // pid is moved as HashMap key; pid_for_net used below for network registration.
+        guard.spheres.insert(pid, sphere);
         guard.state_changes += 1;
         guard.mark_dirty();
         (restored, phase)
@@ -545,13 +564,13 @@ async fn register_handler(
     // Register in coupling network
     {
         let mut net = ctx.network.write();
-        net.register(pid, initial_phase, freq);
+        net.register(pid_for_net, initial_phase, freq);
     }
 
     // GAP-1 fix: Broadcast sphere.registered to IPC bus subscribers
     {
         let tick = ctx.state.read().tick;
-        let event = crate::m7_coordination::m30_bus_types::BusEvent::new(
+        let event = crate::m7_coordination::BusEvent::new(
             "sphere.registered".to_owned(),
             serde_json::json!({
                 "sphere_id": pane_id,
@@ -599,7 +618,7 @@ async fn deregister_handler(
         neighbor_weights
     };
 
-    let ghost = {
+    let (total_steps, mem_count) = {
         let mut guard = ctx.state.write();
         let sphere = guard
             .spheres
@@ -632,10 +651,14 @@ async fn deregister_handler(
             work_signature: sphere.work_signature,
             strongest_neighbors,
         };
-        guard.add_ghost(ghost.clone());
+        // Extract scalar fields before consuming ghost into add_ghost(),
+        // avoiding a full GhostTrace clone (Vec<String> top_tools is expensive).
+        let total_steps = ghost.total_steps_lived;
+        let mem_count = ghost.memory_count;
+        guard.add_ghost(ghost);
         guard.state_changes += 1;
         guard.mark_dirty();
-        ghost
+        (total_steps, mem_count)
     };
 
     // Deregister from coupling network
@@ -647,12 +670,12 @@ async fn deregister_handler(
     // GAP-1 fix: Broadcast sphere.deregistered to IPC bus subscribers
     {
         let tick = ctx.state.read().tick;
-        let event = crate::m7_coordination::m30_bus_types::BusEvent::new(
+        let event = crate::m7_coordination::BusEvent::new(
             "sphere.deregistered".to_owned(),
             serde_json::json!({
                 "sphere_id": pane_id,
-                "total_steps": ghost.total_steps_lived,
-                "memory_count": ghost.memory_count,
+                "total_steps": total_steps,
+                "memory_count": mem_count,
                 "tick": tick,
             }),
             tick,
@@ -663,8 +686,8 @@ async fn deregister_handler(
     Ok(Json(serde_json::json!({
         "deregistered": pane_id,
         "ghost": {
-            "total_steps": ghost.total_steps_lived,
-            "memory_count": ghost.memory_count,
+            "total_steps": total_steps,
+            "memory_count": mem_count,
         },
     })))
 }
@@ -717,6 +740,9 @@ async fn memory_handler(
     validate_summary(&body.summary)?;
 
     let pid = PaneId::new(&pane_id);
+    // Destructure body: tool_name is needed in response JSON after being moved into
+    // record_memory(); summary is only consumed by record_memory().
+    let MemoryRequest { tool_name, summary } = body;
 
     let memory_id = {
         let mut guard = ctx.state.write();
@@ -724,7 +750,8 @@ async fn memory_handler(
             .spheres
             .get_mut(&pid)
             .ok_or_else(|| PvError::SphereNotFound(pane_id.clone()))?;
-        let mid = sphere.record_memory(body.tool_name.clone(), body.summary.clone());
+        // Move summary into record_memory(); clone tool_name for the record, kept for response.
+        let mid = sphere.record_memory(tool_name.clone(), summary);
         sphere.touch_heartbeat();
         guard.state_changes += 1;
         guard.mark_dirty();
@@ -736,7 +763,7 @@ async fn memory_handler(
         Json(serde_json::json!({
             "pane_id": pane_id,
             "memory_id": memory_id,
-            "tool_name": body.tool_name,
+            "tool_name": tool_name,
         })),
     ))
 }
@@ -988,6 +1015,8 @@ async fn inbox_send_handler(
     validate_summary(&body.content)?;
 
     let pid = PaneId::new(&pane_id);
+    // Destructure body: from is used in response JSON, content is only consumed.
+    let MessageRequest { from, content } = body;
 
     let message_id = {
         let mut guard = ctx.state.write();
@@ -995,7 +1024,8 @@ async fn inbox_send_handler(
             .spheres
             .get_mut(&pid)
             .ok_or_else(|| PvError::SphereNotFound(pane_id.clone()))?;
-        let mid = sphere.receive_message(body.from.clone(), body.content.clone());
+        // Move from and content directly — receive_message() takes owned Strings.
+        let mid = sphere.receive_message(from.clone(), content);
         guard.state_changes += 1;
         mid
     };
@@ -1005,7 +1035,7 @@ async fn inbox_send_handler(
         Json(serde_json::json!({
             "pane_id": pane_id,
             "message_id": message_id,
-            "from": body.from,
+            "from": from,
         })),
     ))
 }
@@ -1181,7 +1211,7 @@ async fn bus_events_ingest_handler(
     State(ctx): State<AppContext>,
     Json(body): Json<EventIngestRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    use crate::m7_coordination::m30_bus_types::BusEvent;
+    use crate::m7_coordination::BusEvent;
 
     // Validate batch size (max 100 events per request)
     if body.events.is_empty() {
@@ -1192,24 +1222,30 @@ async fn bus_events_ingest_handler(
     }
     let batch_size = body.events.len().min(100);
 
+    // Destructure body so source/channel are available for logging and response
+    // after events Vec is consumed — avoids cloning each serde_json::Value.
+    let EventIngestRequest { source, channel, events } = body;
+
     // Read current tick from field state (lock ordering: state before bus)
     let tick = ctx.state.read().tick;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
 
-    // Publish each event into the bus ring buffer
+    // Publish each event into the bus ring buffer.
+    // into_iter() consumes each Value in-place — no clone of event data needed.
     let mut bus = ctx.bus.write();
     let mut ingested = 0u32;
-    for event_val in body.events.iter().take(batch_size) {
+    for event_val in events.into_iter().take(batch_size) {
         let me_type = event_val
             .get("event_type")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
+            .unwrap_or("unknown")
+            .to_owned();
 
         let bus_event = BusEvent {
-            event_type: format!("{}.{}.{}", body.source, body.channel, me_type),
-            data: event_val.clone(),
+            event_type: format!("{source}.{channel}.{me_type}"),
+            data: event_val,
             tick,
             timestamp,
         };
@@ -1219,8 +1255,8 @@ async fn bus_events_ingest_handler(
     drop(bus);
 
     tracing::info!(
-        source = body.source.as_str(),
-        channel = body.channel.as_str(),
+        source = source.as_str(),
+        channel = channel.as_str(),
         ingested,
         "External events ingested into bus"
     );
@@ -1229,8 +1265,8 @@ async fn bus_events_ingest_handler(
         StatusCode::CREATED,
         Json(serde_json::json!({
             "accepted": ingested,
-            "source": body.source,
-            "channel": body.channel,
+            "source": source,
+            "channel": channel,
         })),
     ))
 }
@@ -1285,34 +1321,39 @@ async fn bus_task_claim_handler(
     Json(body): Json<TaskClaimRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     validate_pane_id(&body.claimer)?;
-    let claim_sphere = PaneId::new(body.claimer.clone());
+    // Retain raw string for response JSON; construct PaneId for claim() at call site.
+    let claimer_str = body.claimer;
+
+    // Read tick from state BEFORE acquiring bus write lock (lock ordering: state before bus).
+    let tick = ctx.state.read().tick;
 
     let ok = {
         let mut bus = ctx.bus.write();
         let task = bus.get_task_mut(&task_id).ok_or_else(|| {
             PvError::BusTaskNotFound(task_id.clone())
         })?;
-        task.claim(claim_sphere)
-    };
-
-    if ok {
-        // Publish task.claimed event
-        {
-            let tick = ctx.state.read().tick;
-            let event = crate::m7_coordination::m30_bus_types::BusEvent::new(
+        // claim() takes PaneId by value — construct here, claimer_str still available below.
+        let claimed = task.claim(PaneId::new(&claimer_str));
+        if claimed {
+            // Publish inside the same bus lock — eliminates a second ctx.bus.write().
+            let event = crate::m7_coordination::BusEvent::new(
                 "task.claimed".into(),
                 serde_json::json!({
                     "task_id": task_id,
-                    "claimer": body.claimer,
+                    "claimer": claimer_str,
                 }),
                 tick,
             );
-            ctx.bus.write().publish_event(event);
+            bus.publish_event(event);
         }
+        claimed
+    };
+
+    if ok {
         Ok(Json(serde_json::json!({
             "task_id": task_id,
             "status": "Claimed",
-            "claimer": body.claimer,
+            "claimer": claimer_str,
         })))
     } else {
         Err(ApiError(PvError::ConfigValidation(
@@ -1326,24 +1367,28 @@ async fn bus_task_complete_handler(
     State(ctx): State<AppContext>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Read tick from state BEFORE acquiring bus write lock (lock ordering: state before bus).
+    let tick = ctx.state.read().tick;
+
     let completed = {
         let mut bus = ctx.bus.write();
         let task = bus.get_task_mut(&task_id).ok_or_else(|| {
             PvError::BusTaskNotFound(task_id.clone())
         })?;
-        task.complete()
-    };
-
-    if completed {
-        {
-            let tick = ctx.state.read().tick;
-            let event = crate::m7_coordination::m30_bus_types::BusEvent::new(
+        let done = task.complete();
+        if done {
+            // Publish inside the same bus lock — eliminates a second ctx.bus.write().
+            let event = crate::m7_coordination::BusEvent::new(
                 "task.completed".into(),
                 serde_json::json!({ "task_id": task_id }),
                 tick,
             );
-            ctx.bus.write().publish_event(event);
+            bus.publish_event(event);
         }
+        done
+    };
+
+    if completed {
         Ok(Json(serde_json::json!({
             "task_id": task_id,
             "status": "Completed",
@@ -1360,24 +1405,28 @@ async fn bus_task_fail_handler(
     State(ctx): State<AppContext>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Read tick from state BEFORE acquiring bus write lock (lock ordering: state before bus).
+    let tick = ctx.state.read().tick;
+
     let failed = {
         let mut bus = ctx.bus.write();
         let task = bus.get_task_mut(&task_id).ok_or_else(|| {
             PvError::BusTaskNotFound(task_id.clone())
         })?;
-        task.fail()
-    };
-
-    if failed {
-        {
-            let tick = ctx.state.read().tick;
-            let event = crate::m7_coordination::m30_bus_types::BusEvent::new(
+        let done = task.fail();
+        if done {
+            // Publish inside the same bus lock — eliminates a second ctx.bus.write().
+            let event = crate::m7_coordination::BusEvent::new(
                 "task.failed".into(),
                 serde_json::json!({ "task_id": task_id }),
                 tick,
             );
-            ctx.bus.write().publish_event(event);
+            bus.publish_event(event);
         }
+        done
+    };
+
+    if failed {
         Ok(Json(serde_json::json!({
             "task_id": task_id,
             "status": "Failed",
@@ -1401,40 +1450,43 @@ async fn bus_cascade_handler(
     State(ctx): State<AppContext>,
     Json(body): Json<CascadeRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let source = PaneId::new(body.source);
-    let target = PaneId::new(body.target);
+    // Retain raw strings for response/event JSON; construct PaneId at call site
+    // to avoid cloning the PaneId (which clones its inner String).
+    let source_str = body.source;
+    let target_str = body.target;
 
     let index = {
         let mut cascade = ctx.cascade.write();
-        cascade.initiate(source.clone(), target.clone(), body.brief)?
+        cascade.initiate(
+            PaneId::new(&source_str),
+            PaneId::new(&target_str),
+            body.brief,
+        )?
     };
+
+    // Read tick from state BEFORE acquiring bus write lock (lock ordering: state before bus).
+    let tick = ctx.state.read().tick;
 
     // Publish cascade event to bus
     {
-        use crate::m7_coordination::m30_bus_types::BusEvent;
-        let tick = {
-            let guard = ctx.state.read();
-            guard.tick
-        };
-        let event = BusEvent::new(
+        let event = crate::m7_coordination::BusEvent::new(
             "cascade.initiated".into(),
             serde_json::json!({
-                "source": source.as_str(),
-                "target": target.as_str(),
+                "source": source_str,
+                "target": target_str,
                 "index": index,
             }),
             tick,
         );
-        let mut bus = ctx.bus.write();
-        bus.publish_event(event);
+        ctx.bus.write().publish_event(event);
     }
 
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
             "cascade_index": index,
-            "source": source.as_str(),
-            "target": target.as_str(),
+            "source": source_str,
+            "target": target_str,
             "status": "dispatched",
         })),
     ))
@@ -1469,10 +1521,8 @@ async fn bus_cascades_handler(State(ctx): State<AppContext>) -> impl IntoRespons
 
 /// GET /bridges/health -- Bridge staleness summary.
 async fn bridges_health_handler(State(ctx): State<AppContext>) -> impl IntoResponse {
-    let staleness = {
-        let guard = ctx.state.read();
-        guard.prev_bridge_staleness.clone()
-    };
+    // BridgeStaleness is Copy (6 bools) — implicit copy, no heap allocation.
+    let staleness = ctx.state.read().prev_bridge_staleness;
 
     Json(serde_json::json!({
         "synthex_stale": staleness.synthex_stale,
@@ -1516,7 +1566,7 @@ async fn propose_handler(
     State(ctx): State<AppContext>,
     Json(body): Json<ProposeRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    use crate::m8_governance::m37_proposals::ProposableParameter;
+    use crate::m8_governance::ProposableParameter;
 
     validate_pane_id(&body.proposer)?;
 
@@ -1562,7 +1612,8 @@ async fn propose_handler(
             parameter,
             body.value,
             current_value,
-            body.reason.clone(),
+            // Move reason directly — it is not referenced after this call.
+            body.reason,
             tick,
         )?
     };
@@ -1585,7 +1636,7 @@ async fn vote_handler(
     Path((pane_id, proposal_id)): Path<(String, String)>,
     Json(body): Json<VoteRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    use crate::m8_governance::m37_proposals::VoteChoice;
+    use crate::m8_governance::VoteChoice;
 
     validate_pane_id(&pane_id)?;
 

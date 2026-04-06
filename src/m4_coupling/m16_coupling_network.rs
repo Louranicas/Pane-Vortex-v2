@@ -96,7 +96,15 @@ impl CouplingNetwork {
     /// natural frequency diversity. Connections to all existing spheres are created.
     pub fn register(&mut self, id: PaneId, phase: f64, frequency: f64) {
         let hash_scale = frequency_hash_scale(&id);
-        let freq = (frequency * hash_scale).clamp(0.1, 10.0);
+        // F08: guard against NaN/infinite frequency. NaN survives .clamp() unchanged
+        // (IEEE 754) and propagates into auto_scale_k(), producing NaN K within 15
+        // ticks, which poisons every phase via mul_add.
+        let safe_freq = if frequency.is_finite() { frequency } else {
+            tracing::warn!(sphere=%id, value=%frequency,
+                "non-finite frequency in register(); defaulting to 0.1");
+            0.1
+        };
+        let freq = (safe_freq * hash_scale).clamp(0.1, 10.0);
 
         // Create bidirectional connections to all existing spheres
         let existing: Vec<PaneId> = self.phases.keys().cloned().collect();
@@ -242,9 +250,12 @@ impl CouplingNetwork {
         };
 
         // Rate limiter: K can change at most 25% per recalculation.
-        // Use max(0.01) so a K of 0.0 doesn't trap the limiter at zero forever.
-        let max_change = self.k.max(0.01) * 0.25;
-        self.k = new_k.clamp(self.k - max_change, self.k + max_change);
+        // F05: use max(0.05) not max(0.01) — at k=0 the old 0.01 floor gave
+        // max_change=0.0025, meaning recovery from K=0 to K=1 would take ~400
+        // recalculations (~8 hours). With 0.05 floor, max_change=0.0125, reducing
+        // recovery time to ~2 hours. Hard floor prevents K drifting to exact zero.
+        let max_change = self.k.max(0.05) * 0.25;
+        self.k = new_k.clamp(self.k - max_change, self.k + max_change).max(0.05);
     }
 
     // ── Phase stepping ──
@@ -301,7 +312,11 @@ impl CouplingNetwork {
                 .clamp(-COUPLING_SUM_CAP, COUPLING_SUM_CAP);
 
             let receptivity = receptivities.get(id).copied().unwrap_or(1.0);
-            let k_effective = self.k * self.k_modulation;
+            // F04: clamp k_effective to [0.0, K_MOD_MAX]. A negative k_modulation
+            // (possible via malformed deserialization) inverts coupling sign, turning
+            // attraction into repulsion and causing divergent r.
+            let k_effective = (self.k * self.k_modulation)
+                .clamp(0.0, m04_constants::K_MOD_MAX);
 
             #[allow(clippy::cast_precision_loss)]
             let d_phase = receptivity.mul_add(
@@ -329,7 +344,8 @@ impl CouplingNetwork {
 
         #[allow(clippy::cast_precision_loss)]
         let n = self.phases.len() as f64;
-        let r = (re / n).hypot(im / n);
+        // F01: clamp to [0.0, 1.0] — fp accumulation can push hypot above 1.0.
+        let r = (re / n).hypot(im / n).clamp(0.0, 1.0);
         let psi = (im / n).atan2(re / n).rem_euclid(TAU);
 
         OrderParameter { r, psi }
@@ -907,5 +923,82 @@ mod tests {
         let b = frequency_hash_scale(&pid("zeta-observer-99"));
         // With 10000 bins in [0.2, 2.0], very different names should diverge
         assert!((a - b).abs() > 0.0, "hashes should differ for different names");
+    }
+
+    // ── Numerical stability regression tests (F01, F04, F05, F08) ──
+
+    /// F08: NaN frequency in register() must not produce NaN K or phases.
+    #[test]
+    fn register_nan_frequency_does_not_produce_nan_k() {
+        let mut net = CouplingNetwork::new();
+        net.register(pid("a"), 0.0, f64::NAN);
+        assert!(net.frequencies[&pid("a")].is_finite(), "NaN frequency must be sanitised");
+        net.register(pid("b"), 1.0, 0.1);
+        net.auto_scale_k();
+        assert!(net.k.is_finite(), "NaN frequency must not propagate to K");
+    }
+
+    /// F08: Infinite frequency in register() must be sanitised.
+    #[test]
+    fn register_infinite_frequency_is_sanitised() {
+        let mut net = CouplingNetwork::new();
+        net.register(pid("a"), 0.0, f64::INFINITY);
+        assert!(net.frequencies[&pid("a")].is_finite(), "Infinite frequency must be clamped");
+    }
+
+    /// F04: Negative k_modulation must not invert coupling (repulsive field).
+    #[test]
+    fn negative_k_modulation_clamped_keeps_phases_finite() {
+        let mut net = CouplingNetwork::new();
+        net.register(pid("a"), 0.0, 0.1);
+        net.register(pid("b"), 1.0, 0.1);
+        // Force negative k_modulation (possible from malformed snapshot deserialization)
+        net.k_modulation = -1.0;
+        net.step();
+        for phase in net.phases.values() {
+            assert!(phase.is_finite(), "phase must remain finite with negative k_mod");
+            assert!(*phase >= 0.0 && *phase < TAU, "phase must remain in [0, TAU)");
+        }
+    }
+
+    /// F01: Order parameter r must never exceed 1.0 regardless of floating-point noise.
+    #[test]
+    fn order_parameter_r_never_exceeds_one() {
+        let mut net = CouplingNetwork::new();
+        // Pack 50 spheres at nearly-identical phases to maximise r
+        for i in 0..50 {
+            #[allow(clippy::cast_precision_loss)]
+            net.register(pid(&format!("s{i}")), 1e-10 * i as f64, 0.1);
+        }
+        for _ in 0..1000 {
+            net.step();
+        }
+        let op = net.order_parameter();
+        assert!(op.r <= 1.0, "r={} must never exceed 1.0", op.r);
+        assert!(op.r >= 0.0, "r must be non-negative");
+    }
+
+    /// F05: K must recover from zero within a bounded number of recalculations.
+    #[test]
+    fn k_recovers_from_zero_within_bounds() {
+        let mut net = CouplingNetwork::new();
+        net.register(pid("a"), 0.0, 0.3);
+        net.register(pid("b"), 1.0, 0.8);
+        net.k = 0.0;
+        for _ in 0..10 {
+            net.auto_scale_k();
+        }
+        assert!(net.k > 0.05, "K must recover from zero; got k={}", net.k);
+    }
+
+    /// F05: K must never fall below the absolute floor (0.05).
+    #[test]
+    fn k_never_falls_below_absolute_floor() {
+        let mut net = CouplingNetwork::new();
+        net.register(pid("a"), 0.0, 0.1);
+        net.register(pid("b"), 1.0, 0.1);
+        net.k = 0.001;
+        net.auto_scale_k();
+        assert!(net.k >= 0.05, "K floor must be 0.05; got k={}", net.k);
     }
 }

@@ -83,6 +83,10 @@ impl ServiceHealth {
     }
 
     /// Record a failed health check.
+    ///
+    /// If the circuit is in `HalfOpen` (recovery probe), a single failure
+    /// immediately returns it to `Open` — the recovery test failed. Otherwise
+    /// the circuit opens once `consecutive_failures` reaches the threshold.
     pub fn record_failure(&mut self, status: u16) {
         let now = now_secs();
         self.healthy = false;
@@ -90,7 +94,10 @@ impl ServiceHealth {
         self.last_checked = now;
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
 
-        if self.consecutive_failures >= CIRCUIT_OPEN_THRESHOLD {
+        if self.circuit_state == CircuitState::HalfOpen {
+            // Recovery probe failed — immediately re-open regardless of count.
+            self.circuit_state = CircuitState::Open;
+        } else if self.consecutive_failures >= CIRCUIT_OPEN_THRESHOLD {
             self.circuit_state = CircuitState::Open;
         }
     }
@@ -446,6 +453,59 @@ mod tests {
         assert_eq!(
             m.get("svc1").unwrap().circuit_state,
             CircuitState::Closed
+        );
+    }
+
+    // -- FINDING-4: HalfOpen -> Open on single failure --
+
+    #[test]
+    fn half_open_failure_immediately_reopens_circuit() {
+        let mut h = ServiceHealth::new("test");
+        for _ in 0..CIRCUIT_OPEN_THRESHOLD {
+            h.record_failure(0);
+        }
+        assert_eq!(h.circuit_state, CircuitState::Open);
+        h.try_half_open();
+        assert_eq!(h.circuit_state, CircuitState::HalfOpen);
+        // Recovery probe fails -- circuit must immediately re-open
+        h.record_failure(503);
+        assert_eq!(
+            h.circuit_state,
+            CircuitState::Open,
+            "single failure in HalfOpen must re-open circuit immediately"
+        );
+    }
+
+    #[test]
+    fn half_open_success_closes_circuit() {
+        let mut h = ServiceHealth::new("test");
+        for _ in 0..CIRCUIT_OPEN_THRESHOLD {
+            h.record_failure(0);
+        }
+        h.try_half_open();
+        h.record_success(200);
+        assert_eq!(
+            h.circuit_state,
+            CircuitState::Closed,
+            "success in HalfOpen must close circuit"
+        );
+    }
+
+    #[test]
+    fn half_open_failure_does_not_require_threshold_to_reopen() {
+        let mut h = ServiceHealth::new("test");
+        for _ in 0..CIRCUIT_OPEN_THRESHOLD {
+            h.record_failure(0);
+        }
+        h.try_half_open();
+        // Simulate consecutive_failures being 0 as if a prior success reset it
+        h.consecutive_failures = 0;
+        h.circuit_state = CircuitState::HalfOpen;
+        h.record_failure(503);
+        assert_eq!(
+            h.circuit_state,
+            CircuitState::Open,
+            "HalfOpen must not linger after probe failure regardless of count"
         );
     }
 }

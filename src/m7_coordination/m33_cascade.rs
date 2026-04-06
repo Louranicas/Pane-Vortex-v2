@@ -134,13 +134,15 @@ impl CascadeHandoff {
 
     /// Whether this cascade needs auto-summarization (depth > threshold).
     #[must_use]
-    pub const fn needs_summarization(&self) -> bool {
+    #[allow(dead_code)] // Cascade depth check; wired to summarization callback in future L7 pass
+    pub(crate) const fn needs_summarization(&self) -> bool {
         self.depth >= AUTO_SUMMARIZE_DEPTH
     }
 
     /// Generate a markdown fallback brief for non-bus-aware recipients.
     #[must_use]
-    pub fn fallback_brief(&self) -> String {
+    #[allow(dead_code)] // Fallback output for non-IPC cascade delivery
+    pub(crate) fn fallback_brief(&self) -> String {
         format!(
             "# Cascade Handoff\n\n**From:** {}\n**To:** {}\n**Depth:** {}\n\n---\n\n{}",
             self.source, self.target, self.depth, self.brief
@@ -179,7 +181,8 @@ impl CascadeTracker {
 
     /// Create a tracker with a custom max depth.
     #[must_use]
-    pub fn with_max_depth(max_depth: u32) -> Self {
+    #[allow(dead_code)] // Test helper + runtime configuration variant
+    pub(crate) fn with_max_depth(max_depth: u32) -> Self {
         Self {
             cascades: VecDeque::new(),
             window_count: 0,
@@ -282,7 +285,8 @@ impl CascadeTracker {
 
     /// Total cascade count (all states).
     #[must_use]
-    pub fn total_count(&self) -> usize {
+    #[allow(dead_code)] // Monitoring metric; wired to /bus/info endpoint in future pass
+    pub(crate) fn total_count(&self) -> usize {
         self.cascades.len()
     }
 
@@ -300,12 +304,14 @@ impl CascadeTracker {
 
     /// Current rate window count.
     #[must_use]
-    pub const fn window_count(&self) -> u32 {
+    #[allow(dead_code)] // Rate window monitoring; used in tests and future rate-limit diagnostics
+    pub(crate) const fn window_count(&self) -> u32 {
         self.window_count
     }
 
     /// Prune old resolved cascades (keep only the most recent `keep` entries).
-    pub fn prune(&mut self, keep: usize) {
+    #[allow(dead_code)] // Memory management API; called in periodic maintenance sweep
+    pub(crate) fn prune(&mut self, keep: usize) {
         while self.cascades.len() > keep {
             if let Some(front) = self.cascades.front() {
                 if front.is_pending() {

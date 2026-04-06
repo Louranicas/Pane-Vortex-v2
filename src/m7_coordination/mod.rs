@@ -30,3 +30,30 @@ pub mod m35_tick;
 
 #[cfg(feature = "persistence")]
 pub mod m36_persistence;
+
+// ── Ergonomic re-exports ──
+
+// IPC bus
+pub use m29_ipc_bus::{BusState, BusSubscriber};
+
+// Bus types
+pub use m30_bus_types::{BusEvent, BusFrame, BusTask, TaskStatus, TaskTarget};
+
+// Conductor
+pub use m31_conductor::Conductor;
+
+// Executor
+pub use m32_executor::{Executor, ExecutorResult};
+
+// Cascade
+pub use m33_cascade::{CascadeHandoff, CascadeTracker};
+
+// Suggestions
+pub use m34_suggestions::{FieldSuggestion, SuggestionEngine, SuggestionType};
+
+// Tick orchestration
+pub use m35_tick::{tick_orchestrator, PhaseTiming, TickResult};
+
+// Persistence (feature-gated)
+#[cfg(feature = "persistence")]
+pub use m36_persistence::PersistenceManager;

@@ -55,8 +55,13 @@ pub fn apply_stdp(
         .filter(|(_, s)| s.status == PaneStatus::Working)
         .collect();
 
-    // Collect connection updates to avoid borrow conflicts
-    let updates: Vec<(PaneId, PaneId, f64)> = network
+    // Collect connection updates to avoid borrow conflicts.
+    // F14: include the pre-update weight (conn.weight) in the tuple so the application
+    // loop has accurate deltas.  In symmetric mode, set_weight(a,b) also updates b→a;
+    // if we read old_weight inside the loop with get_weight(), the b→a connection
+    // would report zero delta (already updated by the a→b pass), under-counting
+    // total_weight_change and ltp_count/ltd_count.
+    let updates: Vec<(PaneId, PaneId, f64, f64)> = network
         .connections
         .iter()
         .filter_map(|conn| {
@@ -93,24 +98,24 @@ pub fn apply_stdp(
                 -m04_constants::HEBBIAN_LTD
             };
 
-            let new_weight = (conn.weight + weight_delta)
+            let old_weight = conn.weight;
+            let new_weight = (old_weight + weight_delta)
                 .clamp(m04_constants::HEBBIAN_WEIGHT_FLOOR, 1.0);
 
-            Some((conn.from.clone(), conn.to.clone(), new_weight))
+            Some((conn.from.clone(), conn.to.clone(), old_weight, new_weight))
         })
         .collect();
 
-    // Apply updates
-    for (from, to, new_weight) in &updates {
-        let old_weight = network.get_weight(from, to).unwrap_or(0.0);
+    // Apply updates and record accurate per-connection deltas.
+    for (from, to, old_weight, new_weight) in &updates {
         network.set_weight(from, to, *new_weight);
 
         let delta = (new_weight - old_weight).abs();
         result.total_weight_change += delta;
 
-        if *new_weight > old_weight {
+        if new_weight > old_weight {
             result.ltp_count += 1;
-        } else if *new_weight < old_weight {
+        } else if new_weight < old_weight {
             result.ltd_count += 1;
         }
 
@@ -551,5 +556,37 @@ mod tests {
         }
         let w = net.get_weight(&pid("a"), &pid("b")).unwrap();
         assert_relative_eq!(w, m04_constants::HEBBIAN_WEIGHT_FLOOR, epsilon = 0.01);
+    }
+
+    // ── Numerical stability regression tests (F14) ──
+
+    /// F14: In symmetric mode, total_weight_change must accurately count both
+    /// directions of an LTP update, not report zero for the mirrored direction.
+    #[test]
+    fn stdp_symmetric_reports_accurate_total_change() {
+        let (mut net, spheres) = setup_two_working();
+        // Ensure asymmetric mode is off (default)
+        assert!(!net.asymmetric_hebbian);
+        let result = apply_stdp(&mut net, &spheres);
+        // With 2 directed connections (a→b and b→a) both LTP, total change must
+        // be > 0.  The pre-fix bug would report delta=0 for the second direction
+        // because get_weight() read the already-updated symmetric value.
+        assert!(
+            result.total_weight_change > 0.0,
+            "symmetric STDP must report non-zero total_weight_change; got {}",
+            result.total_weight_change
+        );
+    }
+
+    /// F14: total_weight_change in LTD mode must be accurately counted.
+    #[test]
+    fn stdp_symmetric_ltd_accurate_total_change() {
+        let (mut net, spheres) = setup_mixed(); // a=Working, b=Idle → LTD
+        let result = apply_stdp(&mut net, &spheres);
+        assert!(
+            result.total_weight_change > 0.0,
+            "LTD in symmetric mode must report non-zero total_weight_change"
+        );
+        assert!(result.ltd_count > 0, "should have LTD updates");
     }
 }

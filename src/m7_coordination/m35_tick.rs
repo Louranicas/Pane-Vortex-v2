@@ -354,7 +354,7 @@ fn tick_field_state(
 /// See `[[GAP-1 Fix — Governance Actuator]]` for design rationale.
 #[cfg(feature = "governance")]
 fn tick_governance(state: &mut AppState, tick: u64) {
-    use crate::m8_governance::m37_proposals::ProposableParameter;
+    use crate::m8_governance::ProposableParameter;
 
     // Process proposals: close expired, resolve voted
     let sphere_count = state.spheres.len();
@@ -810,7 +810,7 @@ mod tests {
     #[cfg(feature = "governance")]
     #[test]
     fn governance_actuator_applies_proposal() {
-        use crate::m8_governance::m37_proposals::{ProposableParameter, VoteChoice};
+        use crate::m8_governance::{ProposableParameter, VoteChoice};
 
         let (mut state, mut network) = make_state_with_spheres(3);
         let conductor = Conductor::new();

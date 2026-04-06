@@ -117,14 +117,24 @@ impl ForgetRequest {
     }
 
     /// Mark the request as completed.
+    ///
+    /// Only valid from `InProgress`. Calling `complete` on an already-`Completed`
+    /// or `Rejected` request is a no-op.
     pub fn complete(&mut self, deleted: usize) {
-        self.status = ForgetStatus::Completed;
-        self.deleted_count = deleted;
+        if self.status == ForgetStatus::InProgress {
+            self.status = ForgetStatus::Completed;
+            self.deleted_count = deleted;
+        }
     }
 
     /// Reject the request.
+    ///
+    /// Valid from `Pending` or `InProgress` only. Calling `reject` on a `Completed`
+    /// request is a no-op.
     pub fn reject(&mut self) {
-        self.status = ForgetStatus::Rejected;
+        if matches!(self.status, ForgetStatus::Pending | ForgetStatus::InProgress) {
+            self.status = ForgetStatus::Rejected;
+        }
     }
 }
 
@@ -287,11 +297,63 @@ mod tests {
         assert_eq!(m.total_data_points, 0);
     }
 
-    // ── Manifest sphere_id ──
+    // -- Manifest sphere_id --
 
     #[test]
     fn manifest_sphere_id_preserved() {
         let m = DataManifest::new(pid("my-sphere"));
         assert_eq!(m.sphere_id.as_str(), "my-sphere");
+    }
+
+    // -- FINDING-14: complete() is guarded --
+
+    #[test]
+    fn complete_noop_when_already_completed() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.start_processing();
+        r.complete(10);
+        assert_eq!(r.deleted_count, 10);
+        r.complete(999);
+        assert_eq!(r.deleted_count, 10, "complete() must be idempotent after Completed");
+        assert_eq!(r.status, ForgetStatus::Completed);
+    }
+
+    #[test]
+    fn complete_noop_when_pending() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.complete(42);
+        assert_eq!(r.status, ForgetStatus::Pending, "complete() must not apply to Pending");
+        assert_eq!(r.deleted_count, 0);
+    }
+
+    // -- FINDING-15: reject() is guarded --
+
+    #[test]
+    fn reject_noop_when_completed() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.start_processing();
+        r.complete(10);
+        assert_eq!(r.status, ForgetStatus::Completed);
+        r.reject();
+        assert_eq!(
+            r.status,
+            ForgetStatus::Completed,
+            "reject() must not downgrade Completed -> Rejected"
+        );
+    }
+
+    #[test]
+    fn reject_allowed_from_pending() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.reject();
+        assert_eq!(r.status, ForgetStatus::Rejected);
+    }
+
+    #[test]
+    fn reject_allowed_from_in_progress() {
+        let mut r = ForgetRequest::new(pid("a"), 1, false);
+        r.start_processing();
+        r.reject();
+        assert_eq!(r.status, ForgetStatus::Rejected);
     }
 }

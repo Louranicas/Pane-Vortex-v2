@@ -76,15 +76,18 @@ pub enum PhaseMessage {
 }
 
 /// Maximum targets in an `EmergencyCoherence` message (C12: bounded collections).
+#[allow(dead_code)] // Used transitively in truncate_fields (pub(crate), not yet wired to callers)
 const EMERGENCY_TARGETS_MAX: usize = 50;
 
 /// Maximum string field length for truncation.
+#[allow(dead_code)] // Used transitively in truncate_fields (pub(crate), not yet wired to callers)
 const STRING_FIELD_MAX: usize = 256;
 
 impl PhaseMessage {
     /// Whether this message has a phase effect when applied.
     #[must_use]
-    pub const fn has_phase_effect(&self) -> bool {
+    #[allow(dead_code)] // Designed API; callers will be added in L7 when field messaging is wired
+    pub(crate) const fn has_phase_effect(&self) -> bool {
         matches!(
             self,
             Self::AttentionAlignment { .. }
@@ -94,7 +97,8 @@ impl PhaseMessage {
     }
 
     /// Truncate all string fields to prevent oversized messages.
-    pub fn truncate_fields(&mut self) {
+    #[allow(dead_code)] // Input sanitization API; wired to message ingestion in L7
+    pub(crate) fn truncate_fields(&mut self) {
         match self {
             Self::AttentionAlignment { context, .. } => {
                 *context = truncate_string(context, STRING_FIELD_MAX);
@@ -119,7 +123,8 @@ impl PhaseMessage {
 
     /// The sender sphere ID.
     #[must_use]
-    pub const fn sender_id(&self) -> &PaneId {
+    #[allow(dead_code)] // Used in message routing (L7 m34_suggestions wires this in a future pass)
+    pub(crate) const fn sender_id(&self) -> &PaneId {
         match self {
             Self::AttentionAlignment { from, .. }
             | Self::ChimeraRequest { from, .. }
@@ -133,7 +138,8 @@ impl PhaseMessage {
     ///
     /// Returns `None` for `EmergencyCoherence` (which has multiple targets).
     #[must_use]
-    pub const fn target_id(&self) -> Option<&PaneId> {
+    #[allow(dead_code)] // Part of message routing API; callers added in future L7 pass
+    pub(crate) const fn target_id(&self) -> Option<&PaneId> {
         match self {
             Self::AttentionAlignment { to, .. }
             | Self::ChimeraRequest { to, .. }
@@ -148,7 +154,8 @@ impl PhaseMessage {
     /// Returns `(target_id, phase_delta)` pairs. `phase_delta` is in radians,
     /// already modulated by message-specific strength.
     #[must_use]
-    pub fn phase_adjustments(
+    #[allow(dead_code)] // Phase computation API for future L4 coupling integration
+    pub(crate) fn phase_adjustments(
         &self,
         sender_phase: f64,
         target_phases: &std::collections::HashMap<PaneId, f64>,

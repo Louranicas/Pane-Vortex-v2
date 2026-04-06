@@ -180,7 +180,8 @@ impl BusTask {
 
     /// Elapsed time since submission (seconds).
     #[must_use]
-    pub fn elapsed_secs(&self) -> f64 {
+    #[allow(dead_code)] // Task timing API; used in future SLA monitoring pass
+    pub(crate) fn elapsed_secs(&self) -> f64 {
         now_secs() - self.submitted_at
     }
 }
@@ -350,7 +351,8 @@ impl BusFrame {
 
     /// Whether this frame is a client-originated message.
     #[must_use]
-    pub const fn is_client_frame(&self) -> bool {
+    #[allow(dead_code)] // Frame classification API; used by bus connection handler
+    pub(crate) const fn is_client_frame(&self) -> bool {
         matches!(
             self,
             Self::Handshake { .. }
@@ -362,7 +364,8 @@ impl BusFrame {
 
     /// Whether this frame is a server-originated message.
     #[must_use]
-    pub const fn is_server_frame(&self) -> bool {
+    #[allow(dead_code)] // Frame classification API; paired with is_client_frame
+    pub(crate) const fn is_server_frame(&self) -> bool {
         matches!(
             self,
             Self::Welcome { .. }

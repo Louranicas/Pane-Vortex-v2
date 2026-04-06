@@ -548,7 +548,9 @@ pub struct BridgeAdjustments {
 }
 
 /// Tracks bridge staleness for transition detection.
-#[derive(Debug, Clone, Default)]
+///
+/// All fields are `bool`, so `Copy` is free and avoids a heap allocation on every read.
+#[derive(Debug, Clone, Copy, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct BridgeStaleness {
     pub synthex_stale: bool,

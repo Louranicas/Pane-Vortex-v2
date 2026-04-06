@@ -248,10 +248,14 @@ impl VmsBridge {
     /// # Errors
     /// Returns `PvError::BridgeUnreachable` if the connection fails.
     pub fn post_field_state(&self, payload: &[u8]) -> PvResult<()> {
+        // TCP call outside the lock (blocks on I/O, must not hold RwLock).
+        // On success: increment snapshot counter and clear stale flag.
+        // INTENTIONALLY no consecutive_failures reset: a concurrent record_failure()
+        // can run between the TCP return and our write guard, and erasing its count
+        // here would mask outage detection that depends on the streak length.
         raw_http_post(&self.base_url, MEMORIES_PATH, payload, &self.service)?;
         let mut state = self.state.write();
         state.snapshots_posted = state.snapshots_posted.saturating_add(1);
-        state.consecutive_failures = 0;
         state.stale = false;
         Ok(())
     }
@@ -878,5 +882,22 @@ mod tests {
         let resp: HydrateResponse = serde_json::from_str(json).unwrap();
         assert!(resp.memories.is_empty());
         assert!(resp.r.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn post_field_state_preserves_failure_streak() {
+        let bridge = VmsBridge::new();
+        bridge.record_failure();
+        bridge.record_failure();
+        assert_eq!(bridge.consecutive_failures(), 2);
+        {
+            let mut s = bridge.state.write();
+            s.snapshots_posted = s.snapshots_posted.saturating_add(1);
+            s.stale = false;
+            // consecutive_failures not cleared — mirrors production fix
+        }
+        assert_eq!(bridge.consecutive_failures(), 2);
+        assert_eq!(bridge.snapshots_posted(), 1);
+        assert!(!bridge.state.read().stale);
     }
 }

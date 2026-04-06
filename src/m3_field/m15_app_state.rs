@@ -115,7 +115,7 @@ pub struct AppState {
     /// Uses `serde(default)` so snapshots without governance data still deserialize.
     #[cfg(feature = "governance")]
     #[serde(default)]
-    pub proposal_manager: crate::m8_governance::m37_proposals::ProposalManager,
+    pub proposal_manager: crate::m8_governance::ProposalManager,
     /// Dynamic `r_target` override from governance proposals (GAP-2).
     #[serde(default)]
     pub r_target_override: Option<f64>,
@@ -161,7 +161,7 @@ impl AppState {
             prev_bridge_staleness: BridgeStaleness::default(),
             cascade_depth: 0,
             #[cfg(feature = "governance")]
-            proposal_manager: crate::m8_governance::m37_proposals::ProposalManager::new(),
+            proposal_manager: crate::m8_governance::ProposalManager::new(),
             r_target_override: None,
             k_mod_budget_max_override: None,
             hebbian_ltp_total: 0,

@@ -34,7 +34,8 @@ pub struct ExecutorResult {
 impl ExecutorResult {
     /// Create a successful result.
     #[must_use]
-    pub fn success(target: PaneId, execution_ms: f64) -> Self {
+    #[allow(dead_code)] // Result constructors for dispatch completions; wired in future L7 pass
+    pub(crate) fn success(target: PaneId, execution_ms: f64) -> Self {
         Self {
             target_sphere: target,
             success: true,
@@ -45,7 +46,8 @@ impl ExecutorResult {
 
     /// Create a failed result.
     #[must_use]
-    pub const fn failure(target: PaneId, reason: String) -> Self {
+    #[allow(dead_code)] // Paired with success(); both used in dispatch result handling
+    pub(crate) const fn failure(target: PaneId, reason: String) -> Self {
         Self {
             target_sphere: target,
             success: false,
@@ -84,7 +86,8 @@ impl Executor {
 
     /// Create an executor with a custom queue depth.
     #[must_use]
-    pub fn with_max_queue(max_queue: usize) -> Self {
+    #[allow(dead_code)] // Test helper + configuration variant
+    pub(crate) fn with_max_queue(max_queue: usize) -> Self {
         Self {
             dispatch_queue: Vec::new(),
             max_queue: max_queue.max(1),
@@ -160,18 +163,21 @@ impl Executor {
 
     /// Current dispatch queue length.
     #[must_use]
-    pub fn queue_len(&self) -> usize {
+    #[allow(dead_code)] // Queue depth monitoring; used in future dispatch rate-limiting
+    pub(crate) fn queue_len(&self) -> usize {
         self.dispatch_queue.len()
     }
 
     /// Clear the dispatch queue.
-    pub fn clear_queue(&mut self) {
+    #[allow(dead_code)] // Queue management API; called on executor reset
+    pub(crate) fn clear_queue(&mut self) {
         self.dispatch_queue.clear();
     }
 
     /// Recent dispatch targets (from the queue).
     #[must_use]
-    pub fn recent_dispatches(&self, n: usize) -> Vec<&PaneId> {
+    #[allow(dead_code)] // Dispatch history for debugging and API inspection
+    pub(crate) fn recent_dispatches(&self, n: usize) -> Vec<&PaneId> {
         self.dispatch_queue.iter().rev().take(n).collect()
     }
 }

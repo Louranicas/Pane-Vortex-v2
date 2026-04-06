@@ -90,14 +90,29 @@ impl ServiceLifecycle {
     }
 
     /// Transition to Stopped state.
+    ///
+    /// Only valid from `Stopping`. Calls from any other state are silently
+    /// ignored — a `Stopped` service calling `stopped()` again is a no-op,
+    /// and a `Failed` service must go through `reset_failures()` first.
     pub fn stopped(&mut self) {
-        self.state = ServiceState::Stopped;
-        self.pid = None;
-        self.stopped_at = now_secs();
+        if self.state == ServiceState::Stopping {
+            self.state = ServiceState::Stopped;
+            self.pid = None;
+            self.stopped_at = now_secs();
+        }
     }
 
-    /// Record a restart. Marks as Failed if max restarts exceeded.
+    /// Record a restart. Marks as `Failed` if max restarts exceeded.
+    ///
+    /// Valid from any state except `Running`. Calling `restart` on a `Running`
+    /// service is a no-op — the caller must stop the service first to avoid
+    /// silently corrupting the restart budget while the service is still live.
+    /// Calling from `Starting` is valid: a start that never reached `Running`
+    /// is itself a failed attempt and should count against the restart budget.
     pub fn restart(&mut self) {
+        if self.state == ServiceState::Running {
+            return;
+        }
         self.restart_count = self.restart_count.saturating_add(1);
         if self.restart_count >= self.max_restarts {
             self.state = ServiceState::Failed;
@@ -262,7 +277,8 @@ mod tests {
         let mut lc = ServiceLifecycle::new("test");
         lc.start();
         lc.running(1234);
-        lc.stopped();
+        lc.stop();    // Running -> Stopping (required before stopped())
+        lc.stopped(); // Stopping -> Stopped
         assert!(lc.pid.is_none());
         assert_eq!(lc.state, ServiceState::Stopped);
     }
@@ -445,9 +461,82 @@ mod tests {
         let mut lc = ServiceLifecycle::new("test");
         lc.start();
         lc.running(1);
-        lc.stopped();
+        lc.stop();     // Running -> Stopping
+        lc.stopped();  // Stopping -> Stopped
         lc.restart();
         assert_eq!(lc.state, ServiceState::Starting);
+        assert_eq!(lc.restart_count, 1);
+    }
+
+    // -- FINDING-1: stopped() is guarded (only from Stopping) --
+
+    #[test]
+    fn stopped_noop_when_already_stopped() {
+        let mut lc = ServiceLifecycle::new("test");
+        lc.stopped(); // Should not change state
+        assert_eq!(lc.state, ServiceState::Stopped);
+    }
+
+    #[test]
+    fn stopped_noop_when_failed() {
+        let mut lc = ServiceLifecycle::new("test");
+        lc.max_restarts = 1;
+        lc.restart();
+        assert!(lc.is_failed());
+        lc.stopped(); // Must not clear Failed state
+        assert!(lc.is_failed());
+    }
+
+    #[test]
+    fn stopped_noop_when_running() {
+        let mut lc = ServiceLifecycle::new("test");
+        lc.start();
+        lc.running(1234);
+        lc.stopped(); // Must not jump Running -> Stopped without Stopping
+        assert_eq!(lc.state, ServiceState::Running);
+    }
+
+    // -- FINDING-2: restart() is guarded (only from stopped states) --
+
+    #[test]
+    fn restart_noop_when_running() {
+        let mut lc = ServiceLifecycle::new("test");
+        lc.start();
+        lc.running(1234);
+        lc.restart(); // Must not corrupt restart_count or skip Stop
+        assert_eq!(lc.state, ServiceState::Running);
+        assert_eq!(lc.restart_count, 0);
+    }
+
+    #[test]
+    fn restart_from_starting_counts_as_failed_attempt() {
+        // Starting without reaching Running = failed start, counts against restart budget.
+        let mut lc = ServiceLifecycle::new("test");
+        lc.start();
+        assert_eq!(lc.state, ServiceState::Starting);
+        lc.restart(); // Valid from Starting -- a start that never reached Running
+        assert_eq!(lc.restart_count, 1);
+        // State transitions back to Starting for the next attempt
+        assert_eq!(lc.state, ServiceState::Starting);
+    }
+
+    #[test]
+    fn restart_allowed_from_stopped() {
+        let mut lc = ServiceLifecycle::new("test");
+        // Stopped is the default initial state
+        lc.restart();
+        assert_eq!(lc.restart_count, 1);
+        assert_eq!(lc.state, ServiceState::Starting);
+    }
+
+    #[test]
+    fn restart_allowed_from_stopping() {
+        let mut lc = ServiceLifecycle::new("test");
+        lc.start();
+        lc.running(1);
+        lc.stop();
+        assert_eq!(lc.state, ServiceState::Stopping);
+        lc.restart();
         assert_eq!(lc.restart_count, 1);
     }
 }
