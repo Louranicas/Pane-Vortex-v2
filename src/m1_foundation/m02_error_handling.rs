@@ -204,14 +204,25 @@ pub trait ErrorClassifier {
 
 impl ErrorClassifier for PvError {
     fn is_retryable(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::BridgeUnreachable { .. }
-                | Self::BridgeError { .. }
-                | Self::BusSocket(_)
-                | Self::Database(_)
-                | Self::Io(_)
-        )
+            | Self::BridgeError { .. }
+            | Self::BusSocket(_)
+            | Self::Database(_) => true,
+            // Only transient IO errors are retryable; permanent failures (NotFound,
+            // PermissionDenied, InvalidInput) will never succeed on a second attempt.
+            Self::Io(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::BrokenPipe
+            ),
+            _ => false,
+        }
     }
 
     fn severity(&self) -> ErrorSeverity {
@@ -541,7 +552,40 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
         let pv_err: PvError = io_err.into();
         assert_eq!(pv_err.code(), 1900);
-        assert!(pv_err.is_retryable()); // IO errors may be transient
+        // NotFound is a permanent failure — retry will never help.
+        assert!(!pv_err.is_retryable(), "NotFound IO error must not be retryable");
+    }
+
+    #[test]
+    fn io_transient_errors_are_retryable() {
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            let pv_err: PvError = std::io::Error::new(kind, "transient").into();
+            assert!(
+                pv_err.is_retryable(),
+                "IO kind {kind:?} should be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn io_permanent_errors_are_not_retryable() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            let pv_err: PvError = std::io::Error::new(kind, "permanent").into();
+            assert!(
+                !pv_err.is_retryable(),
+                "IO kind {kind:?} must not be retryable"
+            );
+        }
     }
 
     #[test]

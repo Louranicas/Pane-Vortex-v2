@@ -155,6 +155,41 @@ pub const R_HISTORY_MAX: usize = 60;
 /// Maximum decision history records.
 pub const DECISION_HISTORY_MAX: usize = 100;
 
+/// Maximum suggestions retained in the `SuggestionEngine` ring buffer.
+pub const SUGGESTION_BUFFER_MAX: usize = 200;
+
+// ──────────────────────────────────────────────────────────────
+// Suggestion engine
+// ──────────────────────────────────────────────────────────────
+
+/// Base confidence for cascade suggestions (before receptivity scaling).
+///
+/// Cascade suggestions are inherently speculative — 0.5 lets receptivity
+/// dominate the final score while preventing zero-confidence suggestions.
+pub const SUGGESTION_CASCADE_BASE_CONFIDENCE: f64 = 0.5;
+
+/// Fixed confidence for reseed suggestions.
+///
+/// Blocked spheres are a clear actionable signal; 0.7 reflects high certainty
+/// that a reseed is worth attempting without implying it will definitely succeed.
+pub const SUGGESTION_RESEED_CONFIDENCE: f64 = 0.7;
+
+// ──────────────────────────────────────────────────────────────
+// Frequency / coupling bounds (compile-time mirrors of CouplingConfig defaults)
+// ──────────────────────────────────────────────────────────────
+
+/// Minimum sphere frequency (Hz). Mirrors `CouplingConfig::frequency_min`.
+pub const FREQUENCY_MIN: f64 = 0.001;
+
+/// Maximum sphere frequency (Hz). Mirrors `CouplingConfig::frequency_max`.
+pub const FREQUENCY_MAX: f64 = 10.0;
+
+/// Minimum coupling strength. Mirrors `CouplingConfig::strength_min`.
+pub const STRENGTH_MIN: f64 = 0.0;
+
+/// Maximum coupling strength. Mirrors `CouplingConfig::strength_max`.
+pub const STRENGTH_MAX: f64 = 2.0;
+
 // ──────────────────────────────────────────────────────────────
 // Sphere dynamics
 // ──────────────────────────────────────────────────────────────
@@ -335,5 +370,32 @@ mod tests {
     #[test]
     fn default_port_matches_ultraplate() {
         assert_eq!(DEFAULT_PORT, 8132);
+    }
+
+    #[test]
+    fn suggestion_constants_in_range() {
+        assert!(SUGGESTION_CASCADE_BASE_CONFIDENCE > 0.0);
+        assert!(SUGGESTION_CASCADE_BASE_CONFIDENCE < 1.0);
+        assert!(SUGGESTION_RESEED_CONFIDENCE > 0.0);
+        assert!(SUGGESTION_RESEED_CONFIDENCE <= 1.0);
+        assert!(SUGGESTION_BUFFER_MAX > 0);
+    }
+
+    #[test]
+    fn suggestion_reseed_confidence_above_cascade() {
+        // Reseed is a clearer signal than cascade, so confidence should be higher.
+        assert!(SUGGESTION_RESEED_CONFIDENCE > SUGGESTION_CASCADE_BASE_CONFIDENCE);
+    }
+
+    #[test]
+    fn frequency_bounds_ordered_and_positive() {
+        assert!(FREQUENCY_MIN > 0.0, "frequency min must be positive");
+        assert!(FREQUENCY_MIN < FREQUENCY_MAX);
+    }
+
+    #[test]
+    fn strength_bounds_ordered() {
+        assert!(STRENGTH_MIN < STRENGTH_MAX);
+        assert!(STRENGTH_MIN >= 0.0);
     }
 }

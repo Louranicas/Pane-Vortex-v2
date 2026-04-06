@@ -308,4 +308,132 @@ mod tests {
 
         assert_eq!(state.last_bridge_adjustments.updated_at, 5);
     }
+
+    // ── Edge cases: apply_k_mod with empty sphere map ──
+
+    #[test]
+    fn apply_k_mod_empty_spheres_returns_neutral() {
+        // With no spheres the consent vector is empty → gate returns neutral 1.0.
+        // k_modulation *= 1.0 → unchanged.
+        let bs = BridgeSet::new();
+        let mut state = AppState::default();
+        let mut network = CouplingNetwork::new();
+        let k_before = network.k_modulation;
+
+        bs.apply_k_mod(&mut state, &mut network);
+
+        assert!(
+            (network.k_modulation - k_before).abs() < f64::EPSILON,
+            "empty fleet must not change k_modulation",
+        );
+    }
+
+    // ── Edge cases: apply_k_mod keeps k_modulation within budget after many ticks ──
+
+    #[test]
+    fn apply_k_mod_repeated_calls_stay_in_budget() {
+        // Verify the post-clamp in apply_k_mod keeps k_modulation bounded
+        // even after 1000 successive calls (simulated tick drift).
+        let bs = BridgeSet::new();
+        let mut state = AppState::default();
+        let mut network = CouplingNetwork::new();
+
+        for t in 0..1000u64 {
+            state.tick = t;
+            bs.apply_k_mod(&mut state, &mut network);
+            assert!(
+                network.k_modulation >= m04_constants::K_MOD_BUDGET_MIN,
+                "k_modulation below min at tick {t}: {}",
+                network.k_modulation,
+            );
+            assert!(
+                network.k_modulation <= m04_constants::K_MOD_BUDGET_MAX,
+                "k_modulation above max at tick {t}: {}",
+                network.k_modulation,
+            );
+        }
+    }
+
+    // ── Edge cases: apply_k_mod with max tick counter ──
+
+    #[test]
+    fn apply_k_mod_at_max_tick_does_not_panic() {
+        let bs = BridgeSet::new();
+        let mut state = AppState::default();
+        state.tick = u64::MAX;
+        let mut network = CouplingNetwork::new();
+        bs.apply_k_mod(&mut state, &mut network);
+        assert!(network.k_modulation.is_finite());
+    }
+
+    // ── Edge cases: build_consents with sphere at receptivity exactly 0.15 ──
+
+    #[test]
+    fn build_consents_receptivity_at_divergence_threshold_is_not_divergent() {
+        // The threshold is `< 0.15`, so exactly 0.15 must NOT trigger divergence.
+        let mut spheres = HashMap::new();
+        let mut s = PaneSphere::new(PaneId::new("edge"), "analyst".to_owned(), 0.1).unwrap();
+        s.receptivity = 0.15;
+        s.total_steps = 100;
+        spheres.insert(PaneId::new("edge"), s);
+
+        let consents = BridgeSet::build_consents(&spheres);
+        assert!(!consents[0].divergence_requested, "receptivity=0.15 is NOT < 0.15");
+    }
+
+    #[test]
+    fn build_consents_receptivity_just_below_threshold_is_divergent() {
+        let mut spheres = HashMap::new();
+        let mut s = PaneSphere::new(PaneId::new("div"), "analyst".to_owned(), 0.1).unwrap();
+        // 0.14999... is < 0.15
+        s.receptivity = 0.149_999;
+        s.total_steps = 100;
+        spheres.insert(PaneId::new("div"), s);
+
+        let consents = BridgeSet::build_consents(&spheres);
+        assert!(consents[0].divergence_requested, "receptivity<0.15 must be divergent");
+    }
+
+    // ── Edge cases: all bridges stale at tick 0 ──
+
+    #[test]
+    fn all_bridges_stale_at_tick_zero_because_never_polled() {
+        // All bridges have last_poll_tick=0 and are marked stale by default.
+        // is_stale(0) checks stale flag (true) OR time condition.
+        let bs = BridgeSet::new();
+        let mut state = AppState::default();
+        let mut network = CouplingNetwork::new();
+
+        bs.apply_k_mod(&mut state, &mut network);
+
+        assert!(state.prev_bridge_staleness.synthex_stale, "synthex must be stale initially");
+        assert!(state.prev_bridge_staleness.nexus_stale, "nexus must be stale initially");
+        assert!(state.prev_bridge_staleness.me_stale, "me must be stale initially");
+    }
+
+    // ── Edge cases: build_consents produces correct newcomer flag ──
+
+    #[test]
+    fn build_consents_newcomer_flag_based_on_total_steps() {
+        let mut spheres = HashMap::new();
+
+        // Sphere with steps=0 → newcomer
+        let mut s_new = PaneSphere::new(PaneId::new("new"), "a".to_owned(), 0.1).unwrap();
+        s_new.total_steps = 0;
+        spheres.insert(PaneId::new("new"), s_new);
+
+        let consents = BridgeSet::build_consents(&spheres);
+        assert!(consents[0].is_newcomer, "sphere with 0 steps must be a newcomer");
+    }
+
+    #[test]
+    fn build_consents_veteran_flag_at_fifty_steps() {
+        let mut spheres = HashMap::new();
+        let mut s = PaneSphere::new(PaneId::new("vet"), "a".to_owned(), 0.1).unwrap();
+        s.total_steps = 50; // Exactly NEWCOMER_STEPS → NOT newcomer
+        spheres.insert(PaneId::new("vet"), s);
+
+        let consents = BridgeSet::build_consents(&spheres);
+        assert!(!consents[0].is_newcomer, "sphere with 50 steps must NOT be a newcomer");
+    }
 }

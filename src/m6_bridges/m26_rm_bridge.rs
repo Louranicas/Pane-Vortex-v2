@@ -48,6 +48,16 @@ const TCP_TIMEOUT_MS: u64 = 2000;
 /// Maximum response body size (bytes).
 const MAX_RESPONSE_SIZE: usize = 32768;
 
+/// Consecutive failure count above which exponential backoff kicks in.
+const FAILURE_BACKOFF_THRESHOLD: u32 = 3;
+
+/// Maximum backoff exponent (2^cap). At cap=4 and `poll_interval`=30 the
+/// effective interval becomes 30 * 2^4 = 480 ticks (~40 min at 5 s/tick).
+const FAILURE_BACKOFF_CAP: u32 = 4;
+
+/// Small drain buffer used after a POST write to let the server close cleanly.
+const DRAIN_BUF_SIZE: usize = 512;
+
 /// Tab character for TSV formatting.
 const TAB: char = '\t';
 
@@ -378,11 +388,17 @@ impl RmBridge {
         self.state.write().last_poll_tick = tick;
     }
 
-    /// Check whether a poll is due at the given tick.
+    /// Check whether a poll (POST) is due at the given tick.
+    ///
+    /// When consecutive failures exceed [`FAILURE_BACKOFF_THRESHOLD`], the effective
+    /// interval is multiplied by `2^shift` (capped at `2^FAILURE_BACKOFF_CAP`).
+    /// This prevents flooding a downed RM service with connection attempts every
+    /// 30 ticks — at 1 M ticks with the service down that is 33,333 failed connects.
     #[must_use]
     pub fn should_poll(&self, current_tick: u64) -> bool {
         let state = self.state.read();
-        current_tick.saturating_sub(state.last_poll_tick) >= self.poll_interval
+        let effective = backoff_interval(self.poll_interval, state.consecutive_failures);
+        current_tick.saturating_sub(state.last_poll_tick) >= effective
     }
 }
 
@@ -516,6 +532,11 @@ fn raw_http_get(addr: &str, path: &str, service: &str) -> PvResult<String> {
 }
 
 /// Send a raw HTTP POST request with TSV content type.
+///
+/// Sets both write and read timeouts before any I/O. After writing the request
+/// body, drains the response so the server can fully close the TCP connection —
+/// this prevents server-side `CLOSE_WAIT` socket accumulation when the remote
+/// service uses `Connection: close`.
 fn raw_http_post_tsv(addr: &str, path: &str, tsv: &str, service: &str) -> PvResult<()> {
     let timeout = Duration::from_millis(TCP_TIMEOUT_MS);
     let mut stream = TcpStream::connect_timeout(
@@ -529,6 +550,23 @@ fn raw_http_post_tsv(addr: &str, path: &str, tsv: &str, service: &str) -> PvResu
         service: service.to_owned(),
         url: addr.to_owned(),
     })?;
+
+    // LEAK-02 fix: set write timeout so a slow or stuck server cannot block this
+    // thread indefinitely during write_all().
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|_| PvError::BridgeUnreachable {
+            service: service.to_owned(),
+            url: addr.to_owned(),
+        })?;
+
+    // Set read timeout for the response drain phase below.
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|_| PvError::BridgeUnreachable {
+            service: service.to_owned(),
+            url: addr.to_owned(),
+        })?;
 
     let host = addr.split(':').next().unwrap_or("localhost");
     let body = tsv.as_bytes();
@@ -547,7 +585,31 @@ fn raw_http_post_tsv(addr: &str, path: &str, tsv: &str, service: &str) -> PvResu
         url: addr.to_owned(),
     })?;
 
+    // LEAK-04 fix: drain the response so the server can fully process the request
+    // and transition its socket through FIN/FIN-ACK cleanly.
+    let mut drain = [0u8; DRAIN_BUF_SIZE];
+    loop {
+        match stream.read(&mut drain) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {} // keep draining until EOF or timeout
+        }
+    }
+
     Ok(())
+}
+
+/// Compute the effective poll interval given a base interval and failure count.
+///
+/// Returns `base * 2^shift` where `shift = (failures
+/// .saturating_sub(FAILURE_BACKOFF_THRESHOLD)).min(FAILURE_BACKOFF_CAP)`.
+fn backoff_interval(base: u64, consecutive_failures: u32) -> u64 {
+    if consecutive_failures < FAILURE_BACKOFF_THRESHOLD {
+        return base;
+    }
+    let shift = consecutive_failures
+        .saturating_sub(FAILURE_BACKOFF_THRESHOLD)
+        .min(FAILURE_BACKOFF_CAP);
+    base.saturating_mul(1u64 << shift)
 }
 
 /// Extract body from a raw HTTP response.
@@ -952,5 +1014,105 @@ mod tests {
             state.records_posted = 10;
         }
         assert_eq!(bridge.records_posted(), 10);
+    }
+
+    // ── Backoff interval helper ──
+
+    #[test]
+    fn backoff_interval_below_threshold_is_base() {
+        assert_eq!(backoff_interval(30, 0), 30);
+        assert_eq!(backoff_interval(30, FAILURE_BACKOFF_THRESHOLD - 1), 30);
+    }
+
+    #[test]
+    fn backoff_interval_at_threshold_no_shift() {
+        // At exactly the threshold: shift = 0 → interval = base.
+        assert_eq!(backoff_interval(30, FAILURE_BACKOFF_THRESHOLD), 30);
+    }
+
+    #[test]
+    fn backoff_interval_one_above_threshold_doubles() {
+        assert_eq!(backoff_interval(30, FAILURE_BACKOFF_THRESHOLD + 1), 60);
+    }
+
+    #[test]
+    fn backoff_interval_two_above_threshold_quadruples() {
+        assert_eq!(backoff_interval(30, FAILURE_BACKOFF_THRESHOLD + 2), 120);
+    }
+
+    #[test]
+    fn backoff_interval_capped_at_max_shift() {
+        let max_effective = 30u64.saturating_mul(1 << FAILURE_BACKOFF_CAP);
+        // Far above threshold must not exceed cap.
+        assert_eq!(
+            backoff_interval(30, FAILURE_BACKOFF_THRESHOLD + FAILURE_BACKOFF_CAP + 10),
+            max_effective
+        );
+    }
+
+    #[test]
+    fn backoff_interval_saturating_no_overflow() {
+        // u64::MAX base must not panic.
+        let _ = backoff_interval(u64::MAX, FAILURE_BACKOFF_THRESHOLD + 2);
+    }
+
+    // ── Backoff applied in should_poll ──
+
+    #[test]
+    fn should_poll_backed_off_after_failures() {
+        let bridge = RmBridge::with_config("127.0.0.1:19999", 30);
+        {
+            let mut state = bridge.state.write();
+            state.consecutive_failures = FAILURE_BACKOFF_THRESHOLD + 1;
+            state.last_poll_tick = 0;
+        }
+        // shift = 1 → multiplier = 2 → effective interval = 60.
+        assert!(!bridge.should_poll(30), "should not poll at tick 30 when backed off to 60");
+        assert!(bridge.should_poll(60), "should poll at tick 60 after backoff");
+    }
+
+    #[test]
+    fn should_poll_no_backoff_below_threshold() {
+        let bridge = RmBridge::with_config("127.0.0.1:19999", 30);
+        {
+            let mut state = bridge.state.write();
+            state.consecutive_failures = FAILURE_BACKOFF_THRESHOLD - 1;
+            state.last_poll_tick = 0;
+        }
+        assert!(bridge.should_poll(30));
+    }
+
+    #[test]
+    fn should_poll_max_backoff_cap_applied() {
+        let bridge = RmBridge::with_config("127.0.0.1:19999", 30);
+        {
+            let mut state = bridge.state.write();
+            // Far beyond threshold — shift capped at FAILURE_BACKOFF_CAP.
+            state.consecutive_failures = FAILURE_BACKOFF_THRESHOLD + FAILURE_BACKOFF_CAP + 100;
+            state.last_poll_tick = 0;
+        }
+        let max_effective = 30u64.saturating_mul(1 << FAILURE_BACKOFF_CAP);
+        // Should not poll before the capped interval.
+        assert!(!bridge.should_poll(max_effective - 1));
+        // Should poll at or after the capped interval.
+        assert!(bridge.should_poll(max_effective));
+    }
+
+    #[test]
+    fn failures_reset_restores_normal_poll_interval() {
+        let bridge = RmBridge::with_config("127.0.0.1:19999", 30);
+        {
+            let mut state = bridge.state.write();
+            state.consecutive_failures = FAILURE_BACKOFF_THRESHOLD + 3;
+            state.last_poll_tick = 0;
+        }
+        // Reset failures as post_record() would.
+        {
+            let mut state = bridge.state.write();
+            state.consecutive_failures = 0;
+            state.stale = false;
+        }
+        // Normal 30-tick interval should be restored.
+        assert!(bridge.should_poll(30));
     }
 }

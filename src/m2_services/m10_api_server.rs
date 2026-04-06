@@ -69,8 +69,8 @@ use crate::m1_foundation::{
     m03_config::PvConfig,
     m04_constants,
     m06_validation::{
-        validate_frequency, validate_pane_id, validate_persona, validate_summary,
-        validate_tool_name, validate_weight,
+        validate_event_channel, validate_event_source, validate_frequency, validate_pane_id,
+        validate_persona, validate_summary, validate_tool_name, validate_weight,
     },
 };
 use crate::m3_field::m15_app_state::SharedState;
@@ -1212,6 +1212,12 @@ async fn bus_events_ingest_handler(
     Json(body): Json<EventIngestRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     use crate::m7_coordination::BusEvent;
+
+    // Validate source and channel before using them in namespaced event_type keys.
+    // Both are embedded verbatim into `event_type` stored in the bus ring buffer;
+    // unbounded or empty values would silently corrupt the key format.
+    validate_event_source(&body.source)?;
+    validate_event_channel(&body.channel)?;
 
     // Validate batch size (max 100 events per request)
     if body.events.is_empty() {

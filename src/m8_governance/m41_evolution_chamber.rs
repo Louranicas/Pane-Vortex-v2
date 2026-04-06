@@ -534,4 +534,200 @@ mod tests {
         assert!(c.patterns[0].confidence.is_finite());
         assert_eq!(c.patterns[0].confidence, 0.0);
     }
+
+    // ── Edge cases: observation_count at u64::MAX does not overflow ──
+
+    #[test]
+    fn observe_pattern_observation_count_saturates_at_u64_max() {
+        let mut c = EvolutionChamber::new();
+        c.observe_pattern(test_pattern());
+        // Forcibly set observation_count to max.
+        c.patterns[0].observation_count = u64::MAX;
+        // Observe again — saturating_add(1) must NOT overflow.
+        c.observe_pattern(test_pattern());
+        assert_eq!(c.patterns[0].observation_count, u64::MAX);
+    }
+
+    // ── Edge cases: empty observation history on initial query ──
+
+    #[test]
+    fn recent_events_empty_chamber_returns_empty() {
+        let c = EvolutionChamber::new();
+        assert!(c.recent_events(10).is_empty());
+    }
+
+    #[test]
+    fn recent_observations_empty_chamber_returns_empty() {
+        let c = EvolutionChamber::new();
+        assert!(c.recent_observations(10).is_empty());
+    }
+
+    #[test]
+    fn recent_events_limit_zero_returns_empty() {
+        let mut c = EvolutionChamber::new();
+        c.record_event(test_event());
+        assert!(c.recent_events(0).is_empty());
+    }
+
+    #[test]
+    fn recent_observations_limit_zero_returns_empty() {
+        let mut c = EvolutionChamber::new();
+        c.record_observation(test_observation());
+        assert!(c.recent_observations(0).is_empty());
+    }
+
+    // ── Edge cases: limit larger than actual count ──
+
+    #[test]
+    fn recent_events_limit_larger_than_count_returns_all() {
+        let mut c = EvolutionChamber::new();
+        for _ in 0..3 {
+            c.record_event(test_event());
+        }
+        assert_eq!(c.recent_events(100).len(), 3);
+    }
+
+    #[test]
+    fn recent_observations_limit_larger_than_count_returns_all() {
+        let mut c = EvolutionChamber::new();
+        for _ in 0..3 {
+            c.record_observation(test_observation());
+        }
+        assert_eq!(c.recent_observations(100).len(), 3);
+    }
+
+    // ── Edge cases: pattern with empty ID ──
+
+    #[test]
+    fn observe_pattern_empty_id_stored_and_updated() {
+        let mut c = EvolutionChamber::new();
+        let mut p = test_pattern();
+        p.id = String::new();
+        c.observe_pattern(p.clone());
+        assert_eq!(c.pattern_count(), 1);
+
+        // A second pattern with the same empty ID should update the existing one.
+        c.observe_pattern(p);
+        assert_eq!(c.pattern_count(), 1);
+        assert_eq!(c.patterns[0].observation_count, 2);
+    }
+
+    // ── Edge cases: mutation with zero-variance confidence (all 1.0) ──
+
+    #[test]
+    fn observe_pattern_confidence_averaging_converges_at_one() {
+        let mut c = EvolutionChamber::new();
+        // Insert with confidence 1.0.
+        let mut p = test_pattern();
+        p.confidence = 1.0;
+        c.observe_pattern(p.clone());
+
+        // Observe 100 more times with confidence 1.0.
+        for _ in 0..100 {
+            c.observe_pattern(p.clone());
+        }
+
+        // Running average of (1.0, 1.0, ...) must stay at 1.0.
+        assert!(
+            (c.patterns[0].confidence - 1.0).abs() < 1e-10,
+            "confidence must remain 1.0 when all observations are 1.0: {}",
+            c.patterns[0].confidence,
+        );
+    }
+
+    #[test]
+    fn observe_pattern_confidence_averaging_converges_at_zero() {
+        let mut c = EvolutionChamber::new();
+        let mut p = test_pattern();
+        p.confidence = 0.0;
+        c.observe_pattern(p.clone());
+
+        for _ in 0..100 {
+            c.observe_pattern(p.clone());
+        }
+
+        // Running average of (0.0, 0.0, ...) must stay at 0.0.
+        assert!(
+            (c.patterns[0].confidence).abs() < 1e-10,
+            "confidence must remain 0.0: {}",
+            c.patterns[0].confidence,
+        );
+    }
+
+    // ── Edge cases: negative confidence on update clamps to 0 ──
+
+    #[test]
+    fn observe_pattern_negative_confidence_on_update_clamps_to_zero() {
+        let mut c = EvolutionChamber::new();
+        c.observe_pattern(test_pattern()); // confidence = 0.8 → stored 0.8
+        let mut p2 = test_pattern();
+        p2.confidence = -1000.0; // Out of range → treated as 0.0
+        c.observe_pattern(p2);
+        // incoming = 0.0 (clamped), avg = (0.8 + 0.0)/2 = 0.4
+        assert!(
+            (c.patterns[0].confidence - 0.4).abs() < 1e-10,
+            "confidence: {}",
+            c.patterns[0].confidence,
+        );
+    }
+
+    // ── Edge cases: involved_spheres empty on emergence event ──
+
+    #[test]
+    fn record_event_with_empty_involved_spheres() {
+        let mut c = EvolutionChamber::new();
+        let e = EmergenceEvent {
+            event_type: EmergenceType::RegimeChange,
+            tick: 0,
+            timestamp: 0.0,
+            involved_spheres: vec![],
+            description: String::new(),
+        };
+        c.record_event(e);
+        assert_eq!(c.event_count(), 1);
+        assert!(c.recent_events(1)[0].involved_spheres.is_empty());
+    }
+
+    // ── Edge cases: capping at max preserves FIFO order ──
+
+    #[test]
+    fn record_event_cap_preserves_fifo_order() {
+        let mut c = EvolutionChamber::new();
+        for i in 0..(DEFAULT_MAX_EVENTS + 10) as u64 {
+            let mut e = test_event();
+            e.tick = i;
+            c.record_event(e);
+        }
+        assert_eq!(c.event_count(), DEFAULT_MAX_EVENTS);
+
+        // Oldest retained event should have tick = 10 (the first 10 were evicted).
+        let oldest = c.events.front().unwrap();
+        assert_eq!(oldest.tick, 10);
+    }
+
+    #[test]
+    fn record_observation_cap_preserves_fifo_order() {
+        let mut c = EvolutionChamber::new();
+        for i in 0..(DEFAULT_MAX_OBSERVATIONS + 10) as u64 {
+            let mut o = test_observation();
+            o.tick = i;
+            c.record_observation(o);
+        }
+        assert_eq!(c.observations.len(), DEFAULT_MAX_OBSERVATIONS);
+        let oldest = c.observations.front().unwrap();
+        assert_eq!(oldest.tick, 10);
+    }
+
+    // ── Edge cases: patterns search performance with many patterns ──
+
+    #[test]
+    fn observe_pattern_many_unique_ids_all_stored() {
+        let mut c = EvolutionChamber::new();
+        for i in 0..200 {
+            let mut p = test_pattern();
+            p.id = format!("pattern-{i}");
+            c.observe_pattern(p);
+        }
+        assert_eq!(c.pattern_count(), 200);
+    }
 }

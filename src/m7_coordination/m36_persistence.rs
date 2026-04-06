@@ -170,6 +170,7 @@ impl PersistenceManager {
                 submitted_by TEXT NOT NULL,
                 claimed_by TEXT,
                 submitted_at REAL NOT NULL,
+                claimed_at REAL,
                 completed_at REAL,
                 created_at REAL NOT NULL DEFAULT (strftime('%s', 'now'))
             );
@@ -789,5 +790,56 @@ mod tests {
             .unwrap();
         let events = pm.recent_events(1).unwrap();
         assert!(events[0].1.contains("日本語"));
+    }
+
+    // ── Schema column verification ──
+
+    #[test]
+    fn bus_tasks_schema_has_claimed_at_column() {
+        // Regression test for BUG-2: bus_tasks was missing the claimed_at column,
+        // silently discarding `BusTask.claimed_at: Option<f64>` from structured queries.
+        let pm = test_manager();
+        let conn = pm.open_bus_db().unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(bus_tasks)").unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            columns.contains(&"claimed_at".to_owned()),
+            "bus_tasks schema must include claimed_at column; found: {columns:?}"
+        );
+    }
+
+    #[test]
+    fn bus_tasks_schema_complete_columns() {
+        // All columns mapped from `BusTask` must exist in the schema.
+        let pm = test_manager();
+        let conn = pm.open_bus_db().unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(bus_tasks)").unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for required in &[
+            "id",
+            "description",
+            "target_type",
+            "target_pane_id",
+            "status",
+            "submitted_by",
+            "claimed_by",
+            "submitted_at",
+            "claimed_at",
+            "completed_at",
+            "created_at",
+        ] {
+            assert!(
+                columns.contains(&(*required).to_owned()),
+                "bus_tasks missing required column: {required}"
+            );
+        }
     }
 }

@@ -37,7 +37,7 @@ pub fn validate_phase(phase: f64) -> PvResult<f64> {
     Ok(phase.rem_euclid(TAU))
 }
 
-/// Validate and clamp a frequency value to [`FREQUENCY_MIN`, `FREQUENCY_MAX`].
+/// Validate and clamp a frequency value to [`m04_constants::FREQUENCY_MIN`], [`m04_constants::FREQUENCY_MAX`].
 ///
 /// # Errors
 /// Returns `PvError::NonFinite` if the input is NaN or infinite.
@@ -48,10 +48,10 @@ pub fn validate_frequency(freq: f64) -> PvResult<f64> {
             value: freq,
         });
     }
-    Ok(freq.clamp(0.001, 10.0))
+    Ok(freq.clamp(m04_constants::FREQUENCY_MIN, m04_constants::FREQUENCY_MAX))
 }
 
-/// Validate and clamp a coupling strength to [0.0, 2.0].
+/// Validate and clamp a coupling strength to [`m04_constants::STRENGTH_MIN`], [`m04_constants::STRENGTH_MAX`].
 ///
 /// # Errors
 /// Returns `PvError::NonFinite` if the input is NaN or infinite.
@@ -62,7 +62,7 @@ pub fn validate_strength(strength: f64) -> PvResult<f64> {
             value: strength,
         });
     }
-    Ok(strength.clamp(0.0, 2.0))
+    Ok(strength.clamp(m04_constants::STRENGTH_MIN, m04_constants::STRENGTH_MAX))
 }
 
 /// Validate and clamp a weight to [`HEBBIAN_WEIGHT_FLOOR`, 1.0].
@@ -214,6 +214,62 @@ pub fn validate_summary(summary: &str) -> PvResult<()> {
     Ok(())
 }
 
+/// Maximum length for an event source identifier (e.g., `"maintenance-engine"`).
+const EVENT_SOURCE_MAX_LEN: usize = 128;
+
+/// Maximum length for an event channel identifier (e.g., `"health"`, `"integration"`).
+const EVENT_CHANNEL_MAX_LEN: usize = 64;
+
+/// Validate an event source identifier for the `/bus/events` ingestion endpoint.
+///
+/// The source is embedded into a namespaced `event_type` key — an unbounded or
+/// specially-crafted source would pollute the bus ring buffer.
+///
+/// Must be 1–128 characters, non-empty.
+///
+/// # Errors
+/// Returns `PvError::EmptyString` or `PvError::StringTooLong`.
+pub fn validate_event_source(source: &str) -> PvResult<()> {
+    if source.is_empty() {
+        return Err(PvError::EmptyString {
+            field: "event_source",
+        });
+    }
+    let char_count = source.chars().count();
+    if char_count > EVENT_SOURCE_MAX_LEN {
+        return Err(PvError::StringTooLong {
+            field: "event_source",
+            len: char_count,
+            max: EVENT_SOURCE_MAX_LEN,
+        });
+    }
+    Ok(())
+}
+
+/// Validate an event channel identifier for the `/bus/events` ingestion endpoint.
+///
+/// The channel is embedded into the `event_type` key alongside `source`. Must be
+/// 1–64 characters.
+///
+/// # Errors
+/// Returns `PvError::EmptyString` or `PvError::StringTooLong`.
+pub fn validate_event_channel(channel: &str) -> PvResult<()> {
+    if channel.is_empty() {
+        return Err(PvError::EmptyString {
+            field: "event_channel",
+        });
+    }
+    let char_count = channel.chars().count();
+    if char_count > EVENT_CHANNEL_MAX_LEN {
+        return Err(PvError::StringTooLong {
+            field: "event_channel",
+            len: char_count,
+            max: EVENT_CHANNEL_MAX_LEN,
+        });
+    }
+    Ok(())
+}
+
 /// Truncate a string to `max_chars` characters (UTF-8 safe).
 ///
 /// Uses `chars().take()` instead of byte slicing to avoid splitting multi-byte chars.
@@ -285,13 +341,13 @@ mod tests {
     #[test]
     fn validate_frequency_clamps_low() {
         let f = validate_frequency(-5.0).unwrap();
-        assert_relative_eq!(f, 0.001, epsilon = 1e-10);
+        assert_relative_eq!(f, m04_constants::FREQUENCY_MIN, epsilon = 1e-10);
     }
 
     #[test]
     fn validate_frequency_clamps_high() {
         let f = validate_frequency(100.0).unwrap();
-        assert_relative_eq!(f, 10.0);
+        assert_relative_eq!(f, m04_constants::FREQUENCY_MAX);
     }
 
     #[test]
@@ -310,13 +366,13 @@ mod tests {
     #[test]
     fn validate_strength_clamps_negative() {
         let s = validate_strength(-1.0).unwrap();
-        assert_relative_eq!(s, 0.0);
+        assert_relative_eq!(s, m04_constants::STRENGTH_MIN);
     }
 
     #[test]
     fn validate_strength_clamps_high() {
         let s = validate_strength(5.0).unwrap();
-        assert_relative_eq!(s, 2.0);
+        assert_relative_eq!(s, m04_constants::STRENGTH_MAX);
     }
 
     #[test]
@@ -502,6 +558,59 @@ mod tests {
     fn validate_summary_rejects_too_long() {
         let long = "a".repeat(1025);
         assert!(validate_summary(&long).is_err());
+    }
+
+    // ── Event source/channel validation ──
+
+    #[test]
+    fn validate_event_source_normal() {
+        assert!(validate_event_source("maintenance-engine").is_ok());
+    }
+
+    #[test]
+    fn validate_event_source_rejects_empty() {
+        assert!(validate_event_source("").is_err());
+    }
+
+    #[test]
+    fn validate_event_source_rejects_too_long() {
+        let long = "a".repeat(129);
+        assert!(validate_event_source(&long).is_err());
+    }
+
+    #[test]
+    fn validate_event_source_accepts_max_length() {
+        let max = "a".repeat(128);
+        assert!(validate_event_source(&max).is_ok());
+    }
+
+    #[test]
+    fn validate_event_channel_normal() {
+        assert!(validate_event_channel("health").is_ok());
+    }
+
+    #[test]
+    fn validate_event_channel_rejects_empty() {
+        assert!(validate_event_channel("").is_err());
+    }
+
+    #[test]
+    fn validate_event_channel_rejects_too_long() {
+        let long = "a".repeat(65);
+        assert!(validate_event_channel(&long).is_err());
+    }
+
+    #[test]
+    fn validate_event_channel_accepts_max_length() {
+        let max = "a".repeat(64);
+        assert!(validate_event_channel(&max).is_ok());
+    }
+
+    #[test]
+    fn validate_event_channel_shorter_limit_than_source() {
+        // Channel limit (64) is smaller than source limit (128) by design.
+        assert!(validate_event_channel(&"a".repeat(64)).is_ok());
+        assert!(validate_event_channel(&"a".repeat(65)).is_err());
     }
 
     // ── String truncation ──

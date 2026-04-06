@@ -44,3 +44,5 @@ CREATE TABLE IF NOT EXISTS coupling_history (
 
 CREATE INDEX IF NOT EXISTS idx_sphere_history_sphere ON sphere_history(sphere_id);
 CREATE INDEX IF NOT EXISTS idx_sphere_history_tick ON sphere_history(tick);
+CREATE INDEX IF NOT EXISTS idx_coupling_history_tick ON coupling_history(tick);
+CREATE INDEX IF NOT EXISTS idx_coupling_history_pair ON coupling_history(sphere_a, sphere_b);

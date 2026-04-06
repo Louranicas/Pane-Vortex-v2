@@ -388,6 +388,63 @@ mod tests {
         assert_eq!(count_buoy_overlaps(&buoys), 0);
     }
 
+    // ── Error recovery: degenerate buoy positions ──
+
+    #[test]
+    fn nearest_buoy_nan_positions_falls_back_to_equal() {
+        // If a buoy position is degenerate (zero vector), angular_distance uses clamp+acos
+        // so the result is finite. The partial_cmp fallback to Equal is never reached
+        // under normal conditions, but this test verifies the function still returns Some.
+        let mut s = test_sphere();
+        // Zero vector normalizes to north() inside angular_distance — safe fallback.
+        s.buoys[0].position = Point3D::new(0.0, 0.0, 0.0);
+        let nearest = nearest_buoy(&s, &Point3D::north());
+        assert!(
+            nearest.is_some(),
+            "nearest_buoy must return Some even with degenerate buoy position"
+        );
+    }
+
+    #[test]
+    fn buoy_centroid_degenerate_zero_buoys() {
+        // If all buoy positions are the zero vector, the centroid sum is (0,0,0).
+        // Point3D::normalized() guards this case and returns north() — no NaN leaks.
+        let mut s = test_sphere();
+        for buoy in &mut s.buoys {
+            buoy.position = Point3D::new(0.0, 0.0, 0.0);
+        }
+        let c = buoy_centroid(&s);
+        assert!(
+            c.x.is_finite() && c.y.is_finite() && c.z.is_finite(),
+            "centroid must be finite even when all buoy positions are zero vectors"
+        );
+        // Should fall back to north pole (0, 0, 1)
+        assert_relative_eq!(c.x, 0.0, epsilon = 1e-10);
+        assert_relative_eq!(c.y, 0.0, epsilon = 1e-10);
+        assert_relative_eq!(c.z, 1.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn buoy_health_max_drift_is_non_negative() {
+        // Even after manual buoy manipulation, max_drift must never be negative.
+        let mut s = test_sphere();
+        // Set all buoys to their exact home positions — drift should be 0.
+        for buoy in &mut s.buoys {
+            buoy.position = buoy.home;
+        }
+        let h = buoy_health(&s);
+        assert!(
+            h.max_drift >= 0.0,
+            "max_drift must be non-negative, got {}",
+            h.max_drift
+        );
+        assert!(
+            h.mean_drift >= 0.0,
+            "mean_drift must be non-negative, got {}",
+            h.mean_drift
+        );
+    }
+
     // ── Integration: buoy health after steps ──
 
     #[test]

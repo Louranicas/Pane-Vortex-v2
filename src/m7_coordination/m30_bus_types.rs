@@ -343,10 +343,15 @@ impl BusFrame {
 
     /// Deserialize a frame from an NDJSON line.
     ///
+    /// Leading and trailing ASCII whitespace — including the `'\n'` appended by
+    /// `tokio::io::AsyncBufReadExt::read_line` and Windows `"\r\n"` — is stripped
+    /// before parsing so that callers do not need to trim themselves.
+    ///
     /// # Errors
-    /// Returns `serde_json::Error` if deserialization fails.
+    /// Returns `serde_json::Error` if deserialization fails (including if the
+    /// trimmed input is empty or contains invalid JSON).
     pub fn from_ndjson(line: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(line)
+        serde_json::from_str(line.trim())
     }
 
     /// Whether this frame is a client-originated message.
@@ -594,6 +599,88 @@ mod tests {
         let back: BusTask = serde_json::from_str(&json).unwrap();
         assert_eq!(back.description, "do stuff");
         assert_eq!(back.submitted_by.as_str(), "alpha");
+        // Verify optional timestamp fields survive round-trip
+        assert!(back.claimed_by.is_none());
+        assert!(back.claimed_at.is_none());
+        assert!(back.completed_at.is_none());
+        assert!(back.submitted_at > 0.0);
+        // Verify status and target variant survived round-trip
+        assert_eq!(back.status, TaskStatus::Pending);
+        assert_eq!(back.target, TaskTarget::FieldDriven);
+    }
+
+    #[test]
+    fn bus_task_serde_roundtrip_with_claimed_state() {
+        let mut task = BusTask::new("claimed work".into(), TaskTarget::AnyIdle, pid("sub"));
+        task.claim(pid("worker"));
+        let json = serde_json::to_string(&task).unwrap();
+        let back: BusTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, TaskStatus::Claimed);
+        assert_eq!(back.claimed_by.as_ref().map(PaneId::as_str), Some("worker"));
+        assert!(back.claimed_at.is_some());
+        assert!(back.completed_at.is_none());
+    }
+
+    #[test]
+    fn bus_task_serde_roundtrip_with_completed_state() {
+        let mut task = BusTask::new("done work".into(), TaskTarget::Willing, pid("sub"));
+        task.claim(pid("worker"));
+        task.complete();
+        let json = serde_json::to_string(&task).unwrap();
+        let back: BusTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, TaskStatus::Completed);
+        assert!(back.completed_at.is_some());
+        assert!(back.claimed_at.is_some());
+    }
+
+    #[test]
+    fn bus_task_serde_roundtrip_specific_target() {
+        let task = BusTask::new(
+            "targeted".into(),
+            TaskTarget::Specific { pane_id: pid("target-sphere") },
+            pid("sub"),
+        );
+        let json = serde_json::to_string(&task).unwrap();
+        let back: BusTask = serde_json::from_str(&json).unwrap();
+        if let TaskTarget::Specific { pane_id } = back.target {
+            assert_eq!(pane_id.as_str(), "target-sphere");
+        } else {
+            panic!("TaskTarget::Specific did not survive round-trip");
+        }
+    }
+
+    #[test]
+    fn ndjson_roundtrip_with_trailing_newline() {
+        // from_ndjson must handle the '\n' appended by AsyncBufReadExt::read_line.
+        let frame = BusFrame::Handshake {
+            pane_id: pid("alpha"),
+            version: "2.0".into(),
+        };
+        let mut line = frame.to_ndjson().unwrap();
+        line.push('\n');
+        let back = BusFrame::from_ndjson(&line).unwrap();
+        assert_eq!(back.frame_type(), "Handshake");
+    }
+
+    #[test]
+    fn ndjson_roundtrip_with_crlf() {
+        // from_ndjson must handle Windows-style line endings.
+        let frame = BusFrame::Welcome {
+            session_id: "sess-1".into(),
+            version: "2.0".into(),
+        };
+        let mut line = frame.to_ndjson().unwrap();
+        line.push_str("\r\n");
+        let back = BusFrame::from_ndjson(&line).unwrap();
+        assert_eq!(back.frame_type(), "Welcome");
+    }
+
+    #[test]
+    fn ndjson_whitespace_only_fails() {
+        // Whitespace-only lines are not valid NDJSON frames.
+        assert!(BusFrame::from_ndjson("   ").is_err());
+        assert!(BusFrame::from_ndjson("\t").is_err());
+        assert!(BusFrame::from_ndjson("\n").is_err());
     }
 
     #[test]

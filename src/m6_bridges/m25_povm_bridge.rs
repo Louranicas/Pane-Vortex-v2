@@ -55,6 +55,16 @@ const TCP_TIMEOUT_MS: u64 = 2000;
 /// Maximum response body size (bytes).
 const MAX_RESPONSE_SIZE: usize = 65536;
 
+/// Consecutive failure count above which exponential backoff kicks in.
+const FAILURE_BACKOFF_THRESHOLD: u32 = 3;
+
+/// Maximum backoff exponent (2^cap). At cap=4 and `write_interval`=12 the
+/// effective interval becomes 12 * 2^4 = 192 ticks (~16 min at 5 s/tick).
+const FAILURE_BACKOFF_CAP: u32 = 4;
+
+/// Small drain buffer used after a POST write to let the server close cleanly.
+const DRAIN_BUF_SIZE: usize = 512;
+
 // ──────────────────────────────────────────────────────────────
 // Response types
 // ──────────────────────────────────────────────────────────────
@@ -330,17 +340,26 @@ impl PovmBridge {
     }
 
     /// Check whether a snapshot write is due.
+    ///
+    /// When consecutive failures exceed [`FAILURE_BACKOFF_THRESHOLD`], the effective
+    /// interval is multiplied by `2^shift` (capped at `2^FAILURE_BACKOFF_CAP`).
+    /// This prevents flooding a downed POVM service with connection attempts every
+    /// 12 ticks — at 1 M ticks with the service down that is 83,333 failed connects.
     #[must_use]
     pub fn should_write(&self, current_tick: u64) -> bool {
         let state = self.state.read();
-        current_tick.saturating_sub(state.last_write_tick) >= self.write_interval
+        let effective = backoff_interval(self.write_interval, state.consecutive_failures);
+        current_tick.saturating_sub(state.last_write_tick) >= effective
     }
 
     /// Check whether a pathway read is due.
+    ///
+    /// Applies the same exponential backoff as [`PovmBridge::should_write`].
     #[must_use]
     pub fn should_read(&self, current_tick: u64) -> bool {
         let state = self.state.read();
-        current_tick.saturating_sub(state.last_read_tick) >= self.read_interval
+        let effective = backoff_interval(self.read_interval, state.consecutive_failures);
+        current_tick.saturating_sub(state.last_read_tick) >= effective
     }
 }
 
@@ -454,7 +473,12 @@ fn raw_http_get(addr: &str, path: &str, service: &str) -> PvResult<String> {
     })
 }
 
-/// Send a raw HTTP POST request over TCP (fire-and-forget).
+/// Send a raw HTTP POST request over TCP.
+///
+/// Sets both write and read timeouts before any I/O. After writing the request
+/// body, drains the response so the server can fully close the TCP connection —
+/// this prevents server-side `CLOSE_WAIT` socket accumulation that occurs when
+/// the client drops the stream before the server has flushed its response.
 fn raw_http_post(addr: &str, path: &str, body: &[u8], service: &str) -> PvResult<()> {
     let timeout = Duration::from_millis(TCP_TIMEOUT_MS);
     let mut stream = TcpStream::connect_timeout(
@@ -468,6 +492,23 @@ fn raw_http_post(addr: &str, path: &str, body: &[u8], service: &str) -> PvResult
         service: service.to_owned(),
         url: addr.to_owned(),
     })?;
+
+    // LEAK-01 fix: set write timeout so a slow or stuck server cannot block this
+    // thread indefinitely during write_all().
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|_| PvError::BridgeUnreachable {
+            service: service.to_owned(),
+            url: addr.to_owned(),
+        })?;
+
+    // Set read timeout for the response drain phase below.
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|_| PvError::BridgeUnreachable {
+            service: service.to_owned(),
+            url: addr.to_owned(),
+        })?;
 
     let host = addr.split(':').next().unwrap_or("localhost");
     let request = format!(
@@ -485,7 +526,32 @@ fn raw_http_post(addr: &str, path: &str, body: &[u8], service: &str) -> PvResult
         url: addr.to_owned(),
     })?;
 
+    // LEAK-03 fix: drain the response so the server can fully process the request
+    // and transition its socket through FIN/FIN-ACK cleanly. Without this, the
+    // server socket lingers in CLOSE_WAIT until its read timeout expires.
+    let mut drain = [0u8; DRAIN_BUF_SIZE];
+    loop {
+        match stream.read(&mut drain) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {} // keep draining until EOF or timeout
+        }
+    }
+
     Ok(())
+}
+
+/// Compute the effective poll interval given a base interval and failure count.
+///
+/// Returns `base * 2^shift` where `shift = (failures
+/// .saturating_sub(FAILURE_BACKOFF_THRESHOLD)).min(FAILURE_BACKOFF_CAP)`.
+fn backoff_interval(base: u64, consecutive_failures: u32) -> u64 {
+    if consecutive_failures < FAILURE_BACKOFF_THRESHOLD {
+        return base;
+    }
+    let shift = consecutive_failures
+        .saturating_sub(FAILURE_BACKOFF_THRESHOLD)
+        .min(FAILURE_BACKOFF_CAP);
+    base.saturating_mul(1u64 << shift)
 }
 
 /// Extract body from a raw HTTP response.
@@ -920,5 +986,97 @@ mod tests {
         }
         bridge.record_failure();
         assert_eq!(bridge.consecutive_failures(), u32::MAX);
+    }
+
+    // ── Backoff interval helper ──
+
+    #[test]
+    fn backoff_interval_below_threshold_is_base() {
+        // Fewer than FAILURE_BACKOFF_THRESHOLD failures → no backoff.
+        assert_eq!(backoff_interval(12, 0), 12);
+        assert_eq!(backoff_interval(12, FAILURE_BACKOFF_THRESHOLD - 1), 12);
+    }
+
+    #[test]
+    fn backoff_interval_at_threshold_doubles() {
+        // At exactly the threshold: shift = 0, so interval = base * 2^0 = base.
+        // One above: shift = 1, interval = base * 2.
+        assert_eq!(backoff_interval(12, FAILURE_BACKOFF_THRESHOLD), 12);
+        assert_eq!(backoff_interval(12, FAILURE_BACKOFF_THRESHOLD + 1), 24);
+        assert_eq!(backoff_interval(12, FAILURE_BACKOFF_THRESHOLD + 2), 48);
+    }
+
+    #[test]
+    fn backoff_interval_capped_at_max_shift() {
+        // FAILURE_BACKOFF_CAP = 4 → max multiplier = 2^4 = 16.
+        let max_effective = 12u64.saturating_mul(1 << FAILURE_BACKOFF_CAP);
+        // Far above threshold should not exceed cap.
+        assert_eq!(backoff_interval(12, FAILURE_BACKOFF_THRESHOLD + FAILURE_BACKOFF_CAP + 10), max_effective);
+    }
+
+    #[test]
+    fn backoff_interval_saturating_no_overflow() {
+        // u64::MAX base should not panic.
+        let _ = backoff_interval(u64::MAX, FAILURE_BACKOFF_THRESHOLD + 2);
+    }
+
+    // ── Backoff applied in should_write / should_read ──
+
+    #[test]
+    fn should_write_backed_off_after_failures() {
+        let bridge = PovmBridge::with_config("127.0.0.1:19999", 12, 60);
+        // Simulate FAILURE_BACKOFF_THRESHOLD + 1 failures (shift = 1, multiplier = 2).
+        {
+            let mut state = bridge.state.write();
+            state.consecutive_failures = FAILURE_BACKOFF_THRESHOLD + 1;
+            state.last_write_tick = 0;
+        }
+        // At base interval 12, one write would be due at tick 12.
+        // After backoff (multiplier 2), it is due at tick 24.
+        assert!(!bridge.should_write(12), "should not write at tick 12 when backed off to 24");
+        assert!(bridge.should_write(24), "should write at tick 24 after backoff");
+    }
+
+    #[test]
+    fn should_read_backed_off_after_failures() {
+        let bridge = PovmBridge::with_config("127.0.0.1:19999", 12, 60);
+        {
+            let mut state = bridge.state.write();
+            state.consecutive_failures = FAILURE_BACKOFF_THRESHOLD + 1;
+            state.last_read_tick = 0;
+        }
+        // At base 60, shift=1 → 120 ticks.
+        assert!(!bridge.should_read(60), "should not read at tick 60 when backed off to 120");
+        assert!(bridge.should_read(120), "should read at tick 120 after backoff");
+    }
+
+    #[test]
+    fn should_write_no_backoff_below_threshold() {
+        let bridge = PovmBridge::with_config("127.0.0.1:19999", 12, 60);
+        {
+            let mut state = bridge.state.write();
+            state.consecutive_failures = FAILURE_BACKOFF_THRESHOLD - 1;
+            state.last_write_tick = 0;
+        }
+        // Normal interval still applies.
+        assert!(bridge.should_write(12));
+    }
+
+    #[test]
+    fn failures_reset_after_success_restores_normal_interval() {
+        let bridge = PovmBridge::with_config("127.0.0.1:19999", 12, 60);
+        {
+            let mut state = bridge.state.write();
+            state.consecutive_failures = FAILURE_BACKOFF_THRESHOLD + 2;
+            state.last_write_tick = 0;
+        }
+        // After snapshot() success the caller resets consecutive_failures to 0.
+        {
+            let mut state = bridge.state.write();
+            state.consecutive_failures = 0;
+            state.stale = false;
+        }
+        // Normal interval should be restored.
+        assert!(bridge.should_write(12));
     }
 }

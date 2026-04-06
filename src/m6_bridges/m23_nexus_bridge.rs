@@ -267,9 +267,14 @@ impl NexusBridge {
     /// `adj = strategy_mult * (0.7 + 0.3 * r_outer)`
     ///
     /// This means higher `r_outer` (more outer coherence) amplifies the strategy effect.
+    ///
+    /// Non-finite `r_outer` values (NaN, ±infinity) are replaced with `0.0` before
+    /// processing to match the sanitisation performed in `poll_metrics`.
     #[must_use]
     pub fn compute_adjustment(strategy: NexusStrategy, r_outer: f64) -> f64 {
-        let r_clamped = r_outer.clamp(0.0, 1.0);
+        // Treat non-finite r_outer as 0.0 (same guard as poll_metrics line 291-294).
+        let r_safe = if r_outer.is_finite() { r_outer } else { 0.0 };
+        let r_clamped = r_safe.clamp(0.0, 1.0);
         let mult = strategy.coupling_multiplier();
         let adj = mult * r_clamped.mul_add(0.3, 0.7);
         adj.clamp(m04_constants::K_MOD_BUDGET_MIN, m04_constants::K_MOD_BUDGET_MAX)
@@ -865,5 +870,210 @@ mod tests {
         let bridge = NexusBridge::new();
         bridge.set_last_poll_tick(42);
         assert_eq!(bridge.last_poll_tick(), 42);
+    }
+
+    // ── Edge cases: port() with malformed URLs ──
+
+    #[test]
+    fn port_extraction_no_colon_falls_back_to_default() {
+        // A URL with no colon — `split(':').next_back()` gives the whole string
+        // which fails `parse::<u16>()`, so we fall back to `NEXUS_PORT`.
+        let bridge = NexusBridge::with_config("justhost", 60);
+        assert_eq!(bridge.port(), NEXUS_PORT);
+    }
+
+    #[test]
+    fn port_extraction_empty_string_falls_back() {
+        // Empty string: split on ':' gives [""], next_back is Some(""), parse fails.
+        let bridge = NexusBridge::with_config("", 60);
+        assert_eq!(bridge.port(), NEXUS_PORT);
+    }
+
+    #[test]
+    fn port_extraction_non_numeric_port_falls_back() {
+        let bridge = NexusBridge::with_config("localhost:abc", 60);
+        assert_eq!(bridge.port(), NEXUS_PORT);
+    }
+
+    #[test]
+    fn port_extraction_port_zero() {
+        // Port 0 is technically valid u16. Verify it parses correctly.
+        let bridge = NexusBridge::with_config("localhost:0", 60);
+        assert_eq!(bridge.port(), 0);
+    }
+
+    #[test]
+    fn port_extraction_port_65535() {
+        let bridge = NexusBridge::with_config("localhost:65535", 60);
+        assert_eq!(bridge.port(), 65535);
+    }
+
+    #[test]
+    fn port_extraction_overflow_falls_back() {
+        // 65536 exceeds u16::MAX — parse fails, falls back to default.
+        let bridge = NexusBridge::with_config("localhost:65536", 60);
+        assert_eq!(bridge.port(), NEXUS_PORT);
+    }
+
+    #[test]
+    fn port_extraction_ipv6_style_last_segment() {
+        // `::1:8100` — `next_back()` gives "8100" which is a valid port.
+        let bridge = NexusBridge::with_config("::1:8100", 60);
+        assert_eq!(bridge.port(), 8100);
+    }
+
+    // ── Edge cases: compute_adjustment with non-finite r values ──
+
+    #[test]
+    fn compute_adjustment_nan_r_produces_finite_result() {
+        // f64::NAN.clamp(0.0, 1.0) is implementation-defined but budget clamp
+        // after ensures a safe finite output regardless.
+        let adj = NexusBridge::compute_adjustment(NexusStrategy::Aligned, f64::NAN);
+        assert!(adj.is_finite(), "NaN r must not produce NaN adjustment");
+        assert!(adj >= m04_constants::K_MOD_BUDGET_MIN);
+        assert!(adj <= m04_constants::K_MOD_BUDGET_MAX);
+    }
+
+    #[test]
+    fn compute_adjustment_positive_infinity_r_treated_as_zero() {
+        // Non-finite r_outer (including +inf) is replaced with 0.0 before clamping.
+        // r_safe = 0.0, mult = 1.10, adj = 1.10 * 0.7 = 0.77 → K_MOD_BUDGET_MIN
+        let adj = NexusBridge::compute_adjustment(NexusStrategy::Aligned, f64::INFINITY);
+        assert!((adj - m04_constants::K_MOD_BUDGET_MIN).abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_adjustment_negative_infinity_r_treated_as_zero() {
+        let adj = NexusBridge::compute_adjustment(NexusStrategy::Aligned, f64::NEG_INFINITY);
+        // r_safe = 0.0, mult = 1.10, adj = 1.10 * 0.7 = 0.77 → K_MOD_BUDGET_MIN
+        assert!((adj - m04_constants::K_MOD_BUDGET_MIN).abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_adjustment_all_strategies_remain_in_budget() {
+        for strategy in &[
+            NexusStrategy::Aligned,
+            NexusStrategy::Partial,
+            NexusStrategy::Diverging,
+            NexusStrategy::Incoherent,
+        ] {
+            for &r in &[0.0, 0.5, 1.0] {
+                let adj = NexusBridge::compute_adjustment(*strategy, r);
+                assert!(
+                    adj >= m04_constants::K_MOD_BUDGET_MIN,
+                    "adj {adj} below min for {strategy:?} r={r}",
+                );
+                assert!(
+                    adj <= m04_constants::K_MOD_BUDGET_MAX,
+                    "adj {adj} above max for {strategy:?} r={r}",
+                );
+            }
+        }
+    }
+
+    // ── Edge cases: poll_interval boundary values ──
+
+    #[test]
+    fn with_config_max_poll_interval() {
+        let bridge = NexusBridge::with_config("localhost:8100", u64::MAX);
+        assert_eq!(bridge.poll_interval(), u64::MAX);
+    }
+
+    #[test]
+    fn should_poll_at_exactly_interval_ticks() {
+        let bridge = NexusBridge::with_config("localhost:8100", 60);
+        // tick = 60, last_poll = 0 → 60 >= 60 → should poll
+        assert!(bridge.should_poll(60));
+    }
+
+    #[test]
+    fn should_poll_one_tick_before_interval() {
+        let bridge = NexusBridge::with_config("localhost:8100", 60);
+        // tick = 59 < 60 → should NOT poll
+        assert!(!bridge.should_poll(59));
+    }
+
+    #[test]
+    fn should_poll_with_u64_max_tick_and_interval() {
+        // saturating_sub(0) = u64::MAX >= u64::MAX → should poll
+        let bridge = NexusBridge::with_config("localhost:8100", u64::MAX);
+        assert!(bridge.should_poll(u64::MAX));
+    }
+
+    // ── Edge cases: failure counter saturating at u32::MAX ──
+
+    #[test]
+    fn consecutive_failures_saturates_at_u32_max() {
+        let bridge = NexusBridge::new();
+        {
+            let mut state = bridge.state.write();
+            state.consecutive_failures = u32::MAX;
+        }
+        bridge.record_failure();
+        assert_eq!(bridge.consecutive_failures(), u32::MAX);
+    }
+
+    // ── Edge cases: staleness near u64::MAX tick ──
+
+    #[test]
+    fn is_stale_does_not_panic_with_tick_near_u64_max() {
+        let bridge = NexusBridge::with_config("localhost:8100", 60);
+        bridge.set_last_poll_tick(u64::MAX - 10);
+        {
+            let mut state = bridge.state.write();
+            state.stale = false;
+        }
+        // saturating_sub(u64::MAX - 10): current=u64::MAX, diff=10 < 120 → NOT stale
+        assert!(!bridge.is_stale(u64::MAX));
+    }
+
+    #[test]
+    fn is_stale_when_last_poll_tick_is_u64_max() {
+        let bridge = NexusBridge::with_config("localhost:8100", 60);
+        bridge.set_last_poll_tick(u64::MAX);
+        {
+            let mut state = bridge.state.write();
+            state.stale = false;
+        }
+        // current=0, last=u64::MAX → saturating_sub = 0 < 120 → NOT stale by time
+        assert!(!bridge.is_stale(0));
+    }
+
+    // ── Edge cases: extract_body edge cases ──
+
+    #[test]
+    fn extract_body_empty_body_after_separator() {
+        // Valid HTTP response with an empty body.
+        let raw = "HTTP/1.1 200 OK\r\n\r\n";
+        let body = extract_body(raw);
+        assert_eq!(body, Some(String::new()));
+    }
+
+    #[test]
+    fn extract_body_multiple_separators_uses_first() {
+        let raw = "Header\r\n\r\nFirst body \r\n\r\n second";
+        let body = extract_body(raw);
+        assert_eq!(body, Some("First body \r\n\r\n second".to_owned()));
+    }
+
+    // ── Edge cases: k_adjustment null in JSON ──
+
+    #[test]
+    fn metrics_response_null_k_adjustment_deserializes_to_none() {
+        let json = r#"{"strategy":"aligned","r_inner":0.5,"r_outer":0.8,"active_modules":10,"k_adjustment":null}"#;
+        let resp: NexusMetricsResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.k_adjustment.is_none());
+    }
+
+    #[test]
+    fn metrics_response_zero_r_outer_produces_valid_adjustment() {
+        let json = r#"{"strategy":"aligned","r_inner":0.0,"r_outer":0.0,"active_modules":0}"#;
+        let resp: NexusMetricsResponse = serde_json::from_str(json).unwrap();
+        let adj = NexusBridge::compute_adjustment(
+            NexusStrategy::from_label(&resp.strategy),
+            resp.r_outer,
+        );
+        assert!(adj >= m04_constants::K_MOD_BUDGET_MIN);
+        assert!(adj <= m04_constants::K_MOD_BUDGET_MAX);
     }
 }

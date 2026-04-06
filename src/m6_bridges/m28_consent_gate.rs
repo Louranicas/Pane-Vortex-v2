@@ -1125,4 +1125,287 @@ mod tests {
         gate.set_budget_max(0.5);
         assert!((gate.budget_max() - 1.0).abs() < 1e-10);
     }
+
+    // ── Edge cases: exactly-zero consenting spheres (quorum boundary) ──
+
+    #[test]
+    fn exactly_one_consenting_sphere_at_minimum_quorum() {
+        // MIN_CONSENTING = 1 — exactly one sphere must not be rejected.
+        let gate = ConsentGate::new();
+        let consents = vec![make_consent("solo", 1.0, 100)];
+        let adj = gate.apply(1.1, &consents, 1).unwrap();
+        // Single sphere, full receptivity → full adjustment passes through.
+        assert!((adj - 1.1).abs() < 1e-10);
+        assert_eq!(gate.rejection_count(), 0);
+    }
+
+    #[test]
+    fn one_consenting_one_opted_out_still_meets_quorum() {
+        let gate = ConsentGate::new();
+        let consents = vec![
+            make_consent("out", 1.0, 100).with_opt_out(true),
+            make_consent("in", 0.5, 100),
+        ];
+        let adj = gate.apply(1.1, &consents, 1).unwrap();
+        // Only "in" consents with 0.5 receptivity → deviation scaled: 1.0 + 0.1*0.5 = 1.05
+        assert!((adj - 1.05).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rejection_count_increments_on_all_opted_out() {
+        let gate = ConsentGate::new();
+        let consents = vec![
+            make_consent("s1", 1.0, 100).with_opt_out(true),
+            make_consent("s2", 1.0, 100).with_opt_out(true),
+        ];
+        let _ = gate.apply(1.1, &consents, 1).unwrap();
+        assert_eq!(gate.rejection_count(), 1);
+    }
+
+    #[test]
+    fn rejection_count_increments_on_empty_consents() {
+        let gate = ConsentGate::new();
+        let _ = gate.apply(1.1, &[], 1).unwrap();
+        assert_eq!(gate.rejection_count(), 1);
+    }
+
+    // ── Edge cases: all-abstentions (all divergence requested) ──
+
+    #[test]
+    fn single_divergence_sphere_below_quorum_returns_neutral() {
+        let gate = ConsentGate::new();
+        let consents = vec![make_consent("d", 1.0, 100).with_divergence(true)];
+        let adj = gate.apply(1.1, &consents, 1).unwrap();
+        assert!((adj - 1.0).abs() < 1e-10);
+        assert_eq!(gate.rejection_count(), 1);
+    }
+
+    // ── Edge cases: extreme receptivity values ──
+
+    #[test]
+    fn apply_with_all_zero_receptivity_returns_neutral() {
+        let gate = ConsentGate::new();
+        // All consenting spheres have receptivity 0.0 → deviation scaled by 0.0 → neutral.
+        let consents: Vec<SphereConsent> = (0..5)
+            .map(|i| make_consent(&format!("s{i}"), 0.0, 100))
+            .collect();
+        let adj = gate.apply(1.1, &consents, 1).unwrap();
+        assert!(
+            (adj - 1.0).abs() < 1e-10,
+            "zero receptivity must collapse to neutral 1.0"
+        );
+    }
+
+    #[test]
+    fn apply_with_mixed_zero_and_full_receptivity() {
+        let gate = ConsentGate::new();
+        // 2 at 0.0, 2 at 1.0 → mean = 0.5
+        let consents = vec![
+            make_consent("a", 0.0, 100),
+            make_consent("b", 0.0, 100),
+            make_consent("c", 1.0, 100),
+            make_consent("d", 1.0, 100),
+        ];
+        let adj = gate.apply(1.1, &consents, 1).unwrap();
+        // deviation = 0.1, mean = 0.5 → 1.0 + 0.1*0.5 = 1.05
+        assert!((adj - 1.05).abs() < 1e-10);
+    }
+
+    // ── Edge cases: raw_adj exactly at budget boundary ──
+
+    #[test]
+    fn apply_raw_adj_exactly_at_budget_min() {
+        let gate = ConsentGate::new();
+        let consents = make_full_fleet(3);
+        let adj = gate.apply(m04_constants::K_MOD_BUDGET_MIN, &consents, 1).unwrap();
+        assert!((adj - m04_constants::K_MOD_BUDGET_MIN).abs() < 1e-10);
+    }
+
+    #[test]
+    fn apply_raw_adj_exactly_at_budget_max() {
+        let gate = ConsentGate::new();
+        let consents = make_full_fleet(3);
+        let adj = gate.apply(m04_constants::K_MOD_BUDGET_MAX, &consents, 1).unwrap();
+        assert!((adj - m04_constants::K_MOD_BUDGET_MAX).abs() < 1e-10);
+    }
+
+    #[test]
+    fn apply_raw_adj_exactly_one() {
+        let gate = ConsentGate::new();
+        let consents = make_full_fleet(3);
+        let adj = gate.apply(1.0, &consents, 1).unwrap();
+        assert!((adj - 1.0).abs() < 1e-10, "neutral in → neutral out");
+    }
+
+    // ── Edge cases: tick counter boundary (u64::MAX) ──
+
+    #[test]
+    fn apply_with_max_tick_does_not_panic() {
+        let gate = ConsentGate::new();
+        let consents = make_full_fleet(3);
+        let adj = gate.apply(1.05, &consents, u64::MAX).unwrap();
+        assert!(adj.is_finite());
+    }
+
+    // ── Edge cases: gate_count saturating at u64::MAX ──
+
+    #[test]
+    fn gate_count_saturates_at_u64_max() {
+        let gate = ConsentGate::new();
+        {
+            let mut state = gate.state.write();
+            state.gate_count = u64::MAX;
+        }
+        let consents = make_full_fleet(2);
+        let _ = gate.apply(1.0, &consents, 1).unwrap();
+        // saturating_add(1) on u64::MAX stays at u64::MAX
+        assert_eq!(gate.gate_count(), u64::MAX);
+    }
+
+    // ── Edge cases: budget_min vs budget_max ordering ──
+
+    #[test]
+    fn set_budget_max_to_minimum_still_clamps_safely() {
+        // set_budget_max(1.0) → budget_max = 1.0, budget_min = 0.85
+        // This is a valid range; clamp(0.85, 1.0) works.
+        let gate = ConsentGate::new();
+        gate.set_budget_max(1.0);
+        let consents = make_full_fleet(3);
+        let adj = gate.apply(1.1, &consents, 1).unwrap();
+        // 1.1 clamped to [0.85, 1.0] → 1.0
+        assert!((adj - 1.0).abs() < 1e-10);
+    }
+
+    // ── Edge cases: newcomer dampening at exact boundary ──
+
+    #[test]
+    fn newcomer_ratio_exactly_half_no_dampening() {
+        // newcomer_ratio = 0.5 → condition is > 0.5, not >=, so no dampening.
+        let gate = ConsentGate::new();
+        let consents = vec![
+            make_consent("new1", 1.0, 0),   // newcomer
+            make_consent("new2", 1.0, 0),   // newcomer
+            make_consent("vet1", 1.0, 100), // veteran
+            make_consent("vet2", 1.0, 100), // veteran
+        ];
+        // 2 of 4 are newcomers → ratio = 0.5, not > 0.5 → no dampening
+        let adj_undampened = gate.apply(1.1, &consents, 1).unwrap();
+
+        // Compare to all-newcomer fleet (ratio = 1.0 → dampened)
+        let all_new: Vec<SphereConsent> = (0..4)
+            .map(|i| make_consent(&format!("n{i}"), 1.0, 0))
+            .collect();
+        let gate2 = ConsentGate::new();
+        let adj_dampened = gate2.apply(1.1, &all_new, 2).unwrap();
+
+        assert!(
+            (adj_undampened - 1.1).abs() < 1e-10,
+            "at ratio=0.5 there must be no dampening"
+        );
+        assert!(
+            (adj_dampened - 1.1).abs() > 1e-6,
+            "all-newcomer fleet must be dampened"
+        );
+    }
+
+    #[test]
+    fn newcomer_ratio_just_over_half_triggers_dampening() {
+        let gate = ConsentGate::new();
+        // 3 newcomers, 2 veterans → ratio = 3/5 = 0.6 > 0.5 → dampening active
+        let consents = vec![
+            make_consent("n1", 1.0, 0),
+            make_consent("n2", 1.0, 0),
+            make_consent("n3", 1.0, 0),
+            make_consent("v1", 1.0, 100),
+            make_consent("v2", 1.0, 100),
+        ];
+        let adj = gate.apply(1.1, &consents, 1).unwrap();
+        // Must be dampened: strictly less than 1.1 and greater than 1.0
+        assert!(
+            adj < 1.1 - 1e-10,
+            "dampening must reduce the adjustment below 1.1: {adj}"
+        );
+        assert!(adj > 1.0, "dampening must not push below neutral: {adj}");
+    }
+
+    // ── Edge cases: apply_combined NaN propagation via product ──
+
+    #[test]
+    fn apply_combined_all_single_nan_bridge_fails() {
+        let gate = ConsentGate::new();
+        let consents = make_full_fleet(3);
+        // One NaN bridge makes the product NaN → error returned.
+        let result = gate.apply_combined_all(
+            1.0, 1.0, 1.0, f64::NAN, 1.0, 1.0, &consents, 1,
+        );
+        assert!(result.is_err(), "NaN from any bridge must propagate as error");
+    }
+
+    #[test]
+    fn apply_combined_all_single_infinity_bridge_fails() {
+        let gate = ConsentGate::new();
+        let consents = make_full_fleet(3);
+        let result = gate.apply_combined_all(
+            1.0, f64::INFINITY, 1.0, 1.0, 1.0, 1.0, &consents, 1,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn apply_combined_all_zero_bridge_adj_passes_through_gating() {
+        // Zero is a valid finite value. Product will be 0.0.
+        // After gating: deviation = 0.0 - 1.0 = -1.0, scaled by receptivity.
+        // Clamped to budget_min (0.85).
+        let gate = ConsentGate::new();
+        let consents = make_full_fleet(3);
+        let result =
+            gate.apply_combined_all(0.0, 1.0, 1.0, 1.0, 1.0, 1.0, &consents, 1);
+        assert!(result.is_ok());
+        let adj = result.unwrap();
+        assert!((adj - m04_constants::K_MOD_BUDGET_MIN).abs() < 1e-10);
+    }
+
+    // ── Edge cases: empty string sphere IDs in overrides ──
+
+    #[test]
+    fn sphere_override_empty_string_id() {
+        let gate = ConsentGate::new();
+        gate.set_sphere_override("", 1.05);
+        assert!((gate.sphere_override("").unwrap() - 1.05).abs() < 1e-10);
+        gate.remove_sphere_override("");
+        assert!(gate.sphere_override("").is_none());
+    }
+
+    // ── Edge cases: validate_adjustment at exact bounds ──
+
+    #[test]
+    fn validate_adjustment_at_k_mod_min() {
+        let v = ConsentGate::validate_adjustment(m04_constants::K_MOD_MIN).unwrap();
+        assert!((v - m04_constants::K_MOD_MIN).abs() < 1e-10);
+    }
+
+    #[test]
+    fn validate_adjustment_at_k_mod_max() {
+        let v = ConsentGate::validate_adjustment(m04_constants::K_MOD_MAX).unwrap();
+        assert!((v - m04_constants::K_MOD_MAX).abs() < 1e-10);
+    }
+
+    #[test]
+    fn validate_adjustment_neg_infinity_is_err() {
+        assert!(ConsentGate::validate_adjustment(f64::NEG_INFINITY).is_err());
+    }
+
+    // ── Edge cases: large sphere fleet (1000 spheres) ──
+
+    #[test]
+    fn apply_with_large_fleet_does_not_panic() {
+        let gate = ConsentGate::new();
+        let consents: Vec<SphereConsent> = (0..1000)
+            .map(|i| make_consent(&format!("s{i}"), 0.8, 100))
+            .collect();
+        let adj = gate.apply(1.05, &consents, 1).unwrap();
+        assert!(adj.is_finite());
+        assert!(adj >= m04_constants::K_MOD_BUDGET_MIN);
+        assert!(adj <= m04_constants::K_MOD_BUDGET_MAX);
+    }
 }

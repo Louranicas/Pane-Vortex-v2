@@ -145,13 +145,11 @@ impl ServiceRegistry {
     /// Register a service.
     ///
     /// # Errors
-    /// Returns `PvError::Internal` if a service with the same ID already exists.
+    /// Returns [`PvError::SphereAlreadyRegistered`] if a service with the same ID already
+    /// exists. This is a structured, expected conflict — not an internal invariant violation.
     pub fn register(&mut self, def: ServiceDefinition) -> PvResult<()> {
         if self.services.contains_key(&def.id) {
-            return Err(PvError::Internal(format!(
-                "service '{}' already registered",
-                def.id
-            )));
+            return Err(PvError::SphereAlreadyRegistered(def.id));
         }
         self.services.insert(def.id.clone(), def);
         Ok(())
@@ -286,6 +284,51 @@ mod tests {
         let svc2 = ServiceDefinition::builder("test", 9998).build();
         assert!(reg.register(svc1).is_ok());
         assert!(reg.register(svc2).is_err());
+    }
+
+    #[test]
+    fn register_duplicate_returns_correct_variant() {
+        let mut reg = ServiceRegistry::new();
+        reg.register(ServiceDefinition::builder("dup-svc", 9999).build())
+            .expect("first registration must succeed");
+        let err = reg
+            .register(ServiceDefinition::builder("dup-svc", 9998).build())
+            .expect_err("second registration must fail");
+        assert!(
+            matches!(err, PvError::SphereAlreadyRegistered(ref id) if id == "dup-svc"),
+            "expected SphereAlreadyRegistered(\"dup-svc\"), got {err:?}"
+        );
+        // PV-1201 — not an internal error (PV-1999)
+        use crate::m1_foundation::m02_error_handling::ErrorClassifier;
+        assert_eq!(err.code(), 1201, "duplicate service must be code 1201, not internal");
+    }
+
+    #[test]
+    fn register_duplicate_is_not_internal_error() {
+        // PvError::Internal is reserved for impossible states. A duplicate service
+        // registration is an expected conflict with code 1201, not 1999.
+        let mut reg = ServiceRegistry::new();
+        reg.register(ServiceDefinition::builder("svc-a", 9001).build())
+            .unwrap();
+        let err = reg
+            .register(ServiceDefinition::builder("svc-a", 9002).build())
+            .unwrap_err();
+        assert!(
+            !matches!(err, PvError::Internal(_)),
+            "duplicate registration must not produce Internal error"
+        );
+    }
+
+    #[test]
+    fn register_preserves_state_after_duplicate_rejection() {
+        // After rejecting a duplicate, the original entry must remain intact.
+        let mut reg = ServiceRegistry::new();
+        reg.register(ServiceDefinition::builder("stable", 8000).build())
+            .unwrap();
+        let _ = reg.register(ServiceDefinition::builder("stable", 8001).build());
+        let svc = reg.get("stable").expect("original entry must still exist");
+        assert_eq!(svc.port, 8000, "original port must not be overwritten");
+        assert_eq!(reg.count(), 1, "registry must contain exactly one entry");
     }
 
     // ── Lookup ──

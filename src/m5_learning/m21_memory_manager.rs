@@ -434,6 +434,86 @@ mod tests {
         assert_relative_eq!(stats.mean_per_sphere, 0.0);
     }
 
+    // ── Error recovery: boundary and degenerate states ──
+
+    #[test]
+    fn fleet_stats_mean_is_zero_for_empty_map() {
+        // fleet_memory_stats guards the empty case before dividing by sphere count.
+        // This confirms no divide-by-zero on the empty path.
+        let spheres: HashMap<PaneId, PaneSphere> = HashMap::new();
+        let stats = fleet_memory_stats(&spheres);
+        assert_relative_eq!(stats.mean_per_sphere, 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn fleet_stats_near_capacity_boundary() {
+        // Boundary: exactly MEMORY_MAX_COUNT - 50 memories → should be counted as near capacity.
+        let threshold = m04_constants::MEMORY_MAX_COUNT - 50;
+        let mut spheres = HashMap::new();
+        spheres.insert(pid("a"), sphere_with_memories(threshold));
+        let stats = fleet_memory_stats(&spheres);
+        assert_eq!(
+            stats.spheres_near_capacity, 1,
+            "sphere with exactly {} memories (MEMORY_MAX_COUNT - 50) must be near capacity",
+            threshold
+        );
+    }
+
+    #[test]
+    fn fleet_stats_below_capacity_not_flagged() {
+        // A sphere with MEMORY_MAX_COUNT - 51 memories must NOT be flagged as near capacity.
+        let below = m04_constants::MEMORY_MAX_COUNT.saturating_sub(51);
+        let mut spheres = HashMap::new();
+        spheres.insert(pid("a"), sphere_with_memories(below));
+        let stats = fleet_memory_stats(&spheres);
+        assert_eq!(
+            stats.spheres_near_capacity, 0,
+            "sphere with {} memories must not be near capacity",
+            below
+        );
+    }
+
+    #[test]
+    fn shared_memories_empty_sphere_a() {
+        // sphere_a has no memories — shared_memories must return empty without panic.
+        let a = test_sphere();
+        let mut b = PaneSphere::new(pid("b"), "b".into(), 0.1).unwrap();
+        b.record_memory("Read".into(), "summary".into());
+        let shared = shared_memories(&a, &b, 1.0);
+        assert!(shared.is_empty(), "no shared memories when sphere_a is empty");
+    }
+
+    #[test]
+    fn shared_memories_empty_sphere_b() {
+        // sphere_b has no memories — must return empty.
+        let mut a = test_sphere();
+        a.record_memory("Read".into(), "summary".into());
+        let b = PaneSphere::new(pid("b"), "b".into(), 0.1).unwrap();
+        let shared = shared_memories(&a, &b, 1.0);
+        assert!(shared.is_empty(), "no shared memories when sphere_b is empty");
+    }
+
+    #[test]
+    fn sphere_top_tools_limit_larger_than_tools() {
+        // limit > unique tools — must not panic, returns all tools.
+        let mut s = test_sphere();
+        s.record_memory("OnlyTool".into(), "a".into());
+        let top = sphere_top_tools(&s, 100);
+        assert_eq!(top.len(), 1, "limit > unique tools must return all tools");
+    }
+
+    #[test]
+    fn tool_frequency_single_sphere_single_memory() {
+        let mut spheres = HashMap::new();
+        let mut s = test_sphere();
+        s.record_memory("Hammer".into(), "x".into());
+        spheres.insert(pid("a"), s);
+        let freq = tool_frequency(&spheres);
+        assert_eq!(freq.len(), 1);
+        assert_eq!(freq[0].0, "Hammer");
+        assert_eq!(freq[0].1, 1);
+    }
+
     // ── Integration ──
 
     #[test]

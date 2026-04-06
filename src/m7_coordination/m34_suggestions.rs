@@ -9,7 +9,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use crate::m1_foundation::m01_core_types::{FieldAction, PaneId};
+use crate::m1_foundation::{
+    m01_core_types::{FieldAction, PaneId},
+    m04_constants,
+};
 use crate::m3_field::{
     m11_sphere::PaneSphere,
     m12_field_state::FieldDecision,
@@ -127,6 +130,8 @@ pub struct SuggestionEngine {
     /// Recent suggestions (bounded ring buffer — O(1) push and eviction via `VecDeque`).
     recent: VecDeque<FieldSuggestion>,
     /// Maximum recent suggestions to retain.
+    ///
+    /// Sourced from [`m04_constants::SUGGESTION_BUFFER_MAX`].
     max_recent: usize,
 }
 
@@ -136,7 +141,7 @@ impl SuggestionEngine {
     pub const fn new() -> Self {
         Self {
             recent: VecDeque::new(),
-            max_recent: 200,
+            max_recent: m04_constants::SUGGESTION_BUFFER_MAX,
         }
     }
 
@@ -262,6 +267,10 @@ impl SuggestionEngine {
     }
 
     /// Suggest cascade for idle spheres when the fleet is mostly idle.
+    ///
+    /// Base confidence is [`m04_constants::SUGGESTION_CASCADE_BASE_CONFIDENCE`]
+    /// scaled by sphere receptivity, making high-receptivity spheres more likely
+    /// to surface above `MIN_CONFIDENCE`.
     #[allow(clippy::unused_self)]
     fn suggest_cascade_for_idle(
         &self,
@@ -276,7 +285,8 @@ impl SuggestionEngine {
 
         for id in &decision.idle_spheres {
             if let Some(sphere) = spheres.get(id) {
-                let confidence = 0.5 * sphere.receptivity;
+                let confidence =
+                    m04_constants::SUGGESTION_CASCADE_BASE_CONFIDENCE * sphere.receptivity;
                 out.push(FieldSuggestion::new(
                     SuggestionType::SuggestCascade,
                     id.clone(),
@@ -292,6 +302,9 @@ impl SuggestionEngine {
     }
 
     /// Suggest reseed for blocked spheres.
+    ///
+    /// Uses a fixed confidence of [`m04_constants::SUGGESTION_RESEED_CONFIDENCE`]
+    /// because a blocked sphere is an unambiguous signal that intervention is warranted.
     #[allow(clippy::unused_self)]
     fn suggest_reseed_for_blocked(
         &self,
@@ -305,7 +318,7 @@ impl SuggestionEngine {
                     SuggestionType::SuggestReseed,
                     id.clone(),
                     format!("sphere {} is blocked, reseed may help", sphere.persona),
-                    0.7,
+                    m04_constants::SUGGESTION_RESEED_CONFIDENCE,
                     decision.tick,
                 ));
             }
@@ -509,6 +522,12 @@ mod tests {
     }
 
     #[test]
+    fn engine_buffer_uses_constant() {
+        let engine = SuggestionEngine::new();
+        assert_eq!(engine.max_recent, m04_constants::SUGGESTION_BUFFER_MAX);
+    }
+
+    #[test]
     fn engine_generate_stable_no_suggestions() {
         let mut engine = SuggestionEngine::new();
         let decision = make_decision(FieldAction::Stable);
@@ -607,6 +626,20 @@ mod tests {
         let suggestions = engine.generate(&decision, &spheres);
         assert!(!suggestions.is_empty());
         assert_eq!(suggestions[0].suggestion_type, SuggestionType::SuggestReseed);
+    }
+
+    #[test]
+    fn engine_reseed_confidence_matches_constant() {
+        let mut engine = SuggestionEngine::new();
+        let mut decision = make_decision(FieldAction::HasBlockedAgents);
+        decision.blocked_spheres = vec![pid("blocked")];
+        let spheres = make_spheres(&[("blocked", PaneStatus::Blocked)]);
+        let suggestions = engine.generate(&decision, &spheres);
+        assert!(!suggestions.is_empty());
+        assert_relative_eq!(
+            suggestions[0].confidence,
+            m04_constants::SUGGESTION_RESEED_CONFIDENCE
+        );
     }
 
     // ── Autonomy filtering ──

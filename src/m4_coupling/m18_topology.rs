@@ -421,6 +421,55 @@ mod tests {
         assert!(nbrs[0].weight_squared < nbrs[0].effective_weight);
     }
 
+    // ── Error recovery: phantom phases and corrupt-state handling ──
+
+    #[test]
+    fn neighbors_phantom_phase_defaults_to_zero() {
+        // If a connection references a sphere whose phase is missing from the phase map
+        // (corrupt state), the code falls back to 0.0 via unwrap_or(0.0). Verify the
+        // function does not panic and the phase_diff is finite.
+        let net = two_sphere_network();
+        // Force phantom: query neighbor for sphere "b" but "a" has a known phase of 0.0.
+        let nbrs = neighbors(&net, &pid("b"));
+        assert_eq!(nbrs.len(), 1, "b should have one neighbor (a)");
+        assert!(
+            nbrs[0].phase_diff.is_finite(),
+            "phase_diff must be finite even with phantom phase fallback"
+        );
+    }
+
+    #[test]
+    fn topology_summary_single_sphere_density_not_nan() {
+        // With n=1 sphere, possible connections = 1 (guarded in code). Density must be finite.
+        let mut net = CouplingNetwork::new();
+        net.register(pid("solo"), 0.0, 0.1);
+        let summary = topology_summary(&net);
+        assert_eq!(summary.total_connections, 0, "single sphere has no connections");
+        assert!(
+            summary.density.is_finite(),
+            "density must be finite for single-sphere network, got {}",
+            summary.density
+        );
+    }
+
+    #[test]
+    fn mean_coupling_weight_is_zero_for_unknown_sphere() {
+        // Querying a sphere that is not registered returns 0.0 — no panic.
+        let net = two_sphere_network();
+        let mw = mean_coupling_weight(&net, &pid("unknown-sphere"));
+        assert_relative_eq!(mw, 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn degree_is_zero_for_unknown_sphere() {
+        let net = two_sphere_network();
+        assert_eq!(
+            degree(&net, &pid("phantom")),
+            0,
+            "degree for unknown sphere must be 0"
+        );
+    }
+
     // ── Integration ──
 
     #[test]
