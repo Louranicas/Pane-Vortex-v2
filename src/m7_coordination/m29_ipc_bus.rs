@@ -1209,6 +1209,28 @@ async fn handle_frame(
             Ok(true)
         }
 
+        // PV2-002 (S100): refresh sphere heartbeat on incoming sphere.status
+        // events. Spheres coordinated only via IPC (no HTTP `/sphere/{id}/status`
+        // calls) would otherwise age past GHOST_DEREGISTER_SECS (900s) and be
+        // swept en masse by `tick_sweep_ghosts`. Cross-ref BUG-011 (snapshot-zero
+        // guard was an orthogonal fix). Fixes 6 historical 9-sphere wipe events.
+        BusFrame::Event { event } => {
+            if event.event_type == "sphere.status" {
+                let pid = event
+                    .data
+                    .get("pane_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PaneId::new);
+                if let Some(pid) = pid {
+                    let mut guard = state.write();
+                    if let Some(sphere) = guard.spheres.get_mut(&pid) {
+                        sphere.touch_heartbeat();
+                    }
+                }
+            }
+            Ok(false)
+        }
+
         other => {
             warn!(
                 session = %session_id,
