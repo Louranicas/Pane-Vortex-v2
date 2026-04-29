@@ -56,10 +56,28 @@ fn init_tracing() {
                 .init();
         }
         Err(_) => {
-            // Fallback to stderr (not stdout — stderr survives pipe breaks better)
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
-                .with_writer(std::io::stderr)
+                .with_writer(|| {
+                    struct SafeStderr;
+                    impl std::io::Write for SafeStderr {
+                        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                            match std::io::stderr().write(buf) {
+                                Ok(n) => Ok(n),
+                                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(buf.len()),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        fn flush(&mut self) -> std::io::Result<()> {
+                            match std::io::stderr().flush() {
+                                Ok(()) => Ok(()),
+                                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                                Err(e) => Err(e),
+                            }
+                        }
+                    }
+                    SafeStderr
+                })
                 .init();
         }
     }
@@ -148,12 +166,11 @@ async fn bridge_smoke_test(state: SharedState) {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let bridges = [
-        ("synthex", 8090_u16),
-        ("nexus", 8100),
+        ("synthex-v2", 8092_u16),
         ("povm", 8125),
         ("reasoning-memory", 8130),
         ("vms", 8120),
-        ("maintenance-engine", 8080),
+        ("maintenance-engine", 8180),
     ];
 
     let mut reachable = Vec::new();
@@ -337,23 +354,28 @@ fn spawn_tick_loop(
             #[cfg(feature = "persistence")]
             if let Some(ref pm) = persistence {
                 // Save decision event every tick
-                let _ = pm.save_event(
+                if let Err(e) = pm.save_event(
                     &format!("{:?}", tick_result.decision.action),
                     &serde_json::to_string(&tick_result.field_state)
                         .unwrap_or_default(),
                     tick_result.tick,
-                );
+                ) {
+                    warn!(tick = tick_result.tick, error = %e, "persistence save_event failed");
+                }
                 // Save field snapshot every SNAPSHOT_INTERVAL ticks
                 if tick_result.should_snapshot {
-                    let _ = pm.save_snapshot(
+                    let k_mod = network.read().k_modulation;
+                    if let Err(e) = pm.save_snapshot(
                         tick_result.tick,
                         tick_result.order_parameter.r,
                         tick_result.order_parameter.psi,
                         tick_result.sphere_count,
                         0,
-                        network.read().k_modulation,
+                        k_mod,
                         "{}",
-                    );
+                    ) {
+                        warn!(tick = tick_result.tick, error = %e, "persistence save_snapshot failed");
+                    }
                 }
             }
 
@@ -385,7 +407,9 @@ fn spawn_bridge_polls(bridges: &Arc<pane_vortex::m6_bridges::BridgeSet>, tick: u
         let b = bridges.clone();
         tokio::spawn(async move {
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = b.synthex.poll_thermal();
+                if let Err(e) = b.synthex.poll_thermal() {
+                    warn!(tick, error = %e, "synthex thermal poll failed");
+                }
             })
             .await;
         });
@@ -397,7 +421,9 @@ fn spawn_bridge_polls(bridges: &Arc<pane_vortex::m6_bridges::BridgeSet>, tick: u
         let b = bridges.clone();
         tokio::spawn(async move {
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = b.nexus.poll_metrics();
+                if let Err(e) = b.nexus.poll_metrics() {
+                    warn!(tick, error = %e, "nexus metrics poll failed");
+                }
             })
             .await;
         });
@@ -409,7 +435,9 @@ fn spawn_bridge_polls(bridges: &Arc<pane_vortex::m6_bridges::BridgeSet>, tick: u
         let b = bridges.clone();
         tokio::spawn(async move {
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = b.me.poll_observer();
+                if let Err(e) = b.me.poll_observer() {
+                    warn!(tick, error = %e, "me observer poll failed");
+                }
             })
             .await;
         });
@@ -570,7 +598,16 @@ async fn bind_with_retry(addr: &str) -> TcpListener {
             continue;
         }
 
-        socket.listen(128).ok();
+        if let Err(e) = socket.listen(128) {
+            warn!(attempt, "listen(128) failed: {e} — retrying");
+            if attempt == m04_constants::BIND_MAX_RETRIES {
+                error!("exhausted listen attempts — exiting");
+                std::process::exit(1);
+            }
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+            continue;
+        }
 
         let std_listener: std::net::TcpListener = socket.into();
         match TcpListener::from_std(std_listener) {
@@ -647,13 +684,19 @@ fn seed_bridge_ticks(
             "tensor": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         }))
         .unwrap_or_default();
-        let _ = bridges.povm.snapshot(&seed_payload);
-        let _ = bridges.vms.post_field_state(&seed_payload);
+        if let Err(e) = bridges.povm.snapshot(&seed_payload) {
+            warn!(error = %e, "seed POVM snapshot failed");
+        }
+        if let Err(e) = bridges.vms.post_field_state(&seed_payload) {
+            warn!(error = %e, "seed VMS post failed");
+        }
         let record = pane_vortex::m6_bridges::m26_rm_bridge::RmRecord::field_state(
             format!("seed tick={restored_tick}"),
             0.0,
         );
-        let _ = bridges.rm.post_record(&record);
+        if let Err(e) = bridges.rm.post_record(&record) {
+            warn!(error = %e, "seed RM post failed");
+        }
     }
     bridges
 }
@@ -715,6 +758,16 @@ fn seed_diversity(
 #[allow(clippy::too_many_lines)]
 async fn main() {
     init_tracing();
+
+    // BUG-001b defense: refuse to start if another pane-vortex is already running
+    // from the same binary. Lock auto-releases on Drop at the end of main.
+    let _pidlock = match habitat_pidlock::PidLock::acquire("pane-vortex") {
+        Ok(lock) => lock,
+        Err(e) => {
+            error!("pidlock acquire failed: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Load configuration
     let config = match PvConfig::load() {
